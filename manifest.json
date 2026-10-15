@@ -1,0 +1,44 @@
+{
+  "manifest_version": 3,
+  "name": "Scribe",
+  "version": "3.2",
+  "minimum_chrome_version": "116",
+  "description": "Copy any YouTube video's transcript, details and comments in one click, or send them to Claude.",
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.youtube.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "world": "MAIN"
+    },
+    {
+      "matches": ["https://www.youtube.com/*"],
+      "js": ["relay.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://claude.ai/*"],
+      "js": ["ai-inject.js"],
+      "run_at": "document_idle",
+      "all_frames": true,
+      "world": "MAIN"
+    }
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "permissions": ["sidePanel", "storage", "scripting", "declarativeNetRequestWithHostAccess"],
+  "host_permissions": [
+    "https://claude.ai/*",
+    "https://www.youtube.com/*"
+  ]
+}
