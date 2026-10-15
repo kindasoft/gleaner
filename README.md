@@ -7,7 +7,7 @@ Copy any YouTube video's transcript, details and comments for your AI in one cli
 ## What it does
 - **Copy**: one block of text with the video's details (title, channel, date, views, likes, tags, description, chapters), the full transcript with timestamps, and up to 320 top comments with their replies. If you type a question, it goes at the end.
 - **Send to Claude**: opens claude.ai in Chrome's side panel, next to the video, and sends it everything, in your own Claude account.
-- **Export comments**: every comment and every reply on a video, however many there are, as a CSV file for Excel, Google Sheets or Numbers. Each reply sits under the comment it answers. A huge video takes hours, so Stop pauses it anytime: Save spreadsheet gives you what has loaded so far, and Continue carries on.
+- **Export comments**: every comment and every reply on a video, however many there are, as a CSV file for Excel, Google Sheets or Numbers. Each reply sits under the comment it answers. A huge video takes hours, so Stop pauses it anytime: Save spreadsheet gives you what has loaded so far, and Continue carries on. Exports are saved on your computer as they go, so you can close the tab and continue another day, and Update adds just the comments posted since.
 - **Shorts**: a button on Shorts opens the Short as a normal video with the panel ready.
 
 No API key, no account, no servers and no tracking.
@@ -25,7 +25,7 @@ The folder loads as the developer build, called Scribe: Enter in the question bo
 ## How it works
 - `content.js` runs inside YouTube's own page (`"world": "MAIN"`) so it can read the player. It gets the transcript by catching the player's own caption request (if captions are off, it turns them on for a moment and back off), reads the details from the player and the page, and reads comments through the same endpoint the page uses.
 - `relay.js` passes messages between the page and the rest of the extension.
-- `background.js` opens the side panel for Send. While the panel is open, a session rule lets claude.ai load inside it; the rule only matches frames outside browser tabs, so no website can frame claude.ai because of it.
+- `background.js` keeps saved exports in the extension's own storage (IndexedDB) and saves the file through Chrome's downloads, with `offscreen.html` putting the chunks together. It also opens the side panel for Send. While the panel is open, a session rule lets claude.ai load inside it; the rule only matches frames outside browser tabs, so no website can frame claude.ai because of it.
 - `sidepanel.html` and `sidepanel.js` show a fresh claude.ai chat. `ai-inject.js` runs in that frame only: it pastes the video as an attachment, puts your question in the message box and presses send.
 - Export reads YouTube's "Newest first" order, because "Top comments" stops near 1,000 on big videos.
 

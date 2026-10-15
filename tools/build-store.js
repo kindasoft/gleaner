@@ -39,7 +39,7 @@ fs.mkdirSync(path.join(OUT, 'icons'), { recursive: true });
 fs.writeFileSync(path.join(OUT, 'content.js'), content);
 
 // LICENSE too: the MIT License asks for its notice to travel with every copy.
-for (const f of ['background.js', 'relay.js', 'sidepanel.html', 'sidepanel.js', 'ai-inject.js', 'LICENSE']) {
+for (const f of ['background.js', 'relay.js', 'sidepanel.html', 'sidepanel.js', 'ai-inject.js', 'offscreen.html', 'offscreen.js', 'LICENSE']) {
   fs.copyFileSync(path.join(ROOT, f), path.join(OUT, f));
 }
 // The store copy has its own icons (the wheat stalk); the unpacked copy keeps Scribe's.

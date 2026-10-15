@@ -1,6 +1,137 @@
-// The service worker: opens Claude in the side panel for Send, and answers the
-// development messages from the unpacked copy. Everything else happens on the
-// YouTube page (content.js).
+// The service worker: opens Claude in the side panel for Send, keeps comment
+// exports so they can be saved, continued and brought up to date later, and
+// answers the development messages from the unpacked copy. Everything else
+// happens on the YouTube page (content.js).
+
+// ------------------------------------------------------------ saved exports
+//
+// An export is kept here, in Gleaner's own storage on this computer (YouTube
+// can't read it, and clearing YouTube's data doesn't touch it), until the
+// user starts it over or removes Gleaner. The page sends each chunk of the CSV
+// once it's done, together with a note of where the reading stands; both land
+// in one transaction, so they never disagree. A save puts the chunks together
+// in the offscreen document and hands the file to Chrome's downloads.
+
+var DB_NAME = 'gleaner-exports';
+var dbOpen = null;
+function db() {
+  if (!dbOpen) {
+    dbOpen = new Promise(function (resolve, reject) {
+      var req = indexedDB.open(DB_NAME, 1);
+      req.onupgradeneeded = function () {
+        req.result.createObjectStore('meta');  // video id -> where its export stands
+        req.result.createObjectStore('parts'); // [video id, order] -> a Blob of CSV rows
+      };
+      req.onsuccess = function () { resolve(req.result); };
+      req.onerror = function () { dbOpen = null; reject(req.error); };
+    });
+  }
+  return dbOpen;
+}
+
+function partsOf(videoId) { return IDBKeyRange.bound([videoId, -Infinity], [videoId, Infinity]); }
+
+function cacheGet(videoId) {
+  return db().then(function (d) {
+    return new Promise(function (resolve, reject) {
+      var r = d.transaction('meta').objectStore('meta').get(videoId);
+      r.onsuccess = function () { resolve(r.result || null); };
+      r.onerror = function () { reject(r.error); };
+    });
+  });
+}
+
+// A chunk (or none) and the new note, in one transaction. A note older than
+// the one stored (seq) is dropped with its chunk.
+function cacheCommit(videoId, part, meta) {
+  return db().then(function (d) {
+    return new Promise(function (resolve, reject) {
+      var t = d.transaction(['meta', 'parts'], 'readwrite');
+      var metas = t.objectStore('meta');
+      var g = metas.get(videoId);
+      g.onsuccess = function () {
+        if (g.result && g.result.seq > meta.seq) return;
+        if (part) t.objectStore('parts').put(new Blob([part.text], { type: 'text/csv' }), [videoId, part.order]);
+        metas.put(meta, videoId);
+      };
+      t.oncomplete = function () { resolve(true); };
+      t.onerror = t.onabort = function () { reject(t.error); };
+    });
+  });
+}
+
+function cacheDelete(videoId) {
+  return db().then(function (d) {
+    return new Promise(function (resolve, reject) {
+      var t = d.transaction(['meta', 'parts'], 'readwrite');
+      t.objectStore('meta').delete(videoId);
+      t.objectStore('parts').delete(partsOf(videoId));
+      t.oncomplete = function () { resolve(true); };
+      t.onerror = t.onabort = function () { reject(t.error); };
+    });
+  });
+}
+
+// The offscreen document builds the file (a service worker can't make a URL
+// for a Blob), then Chrome's downloads saves it.
+var offscreenMaking = null; // only one offscreen document may exist
+function offscreenReady() {
+  return chrome.runtime.getContexts({ contextTypes: ['OFFSCREEN_DOCUMENT'] }).then(function (found) {
+    if (found.length) return;
+    if (!offscreenMaking) {
+      offscreenMaking = chrome.offscreen.createDocument({
+        url: 'offscreen.html',
+        reasons: ['BLOBS'],
+        justification: 'Puts the saved chunks of a comments export together into one spreadsheet file.'
+      }).finally(function () { offscreenMaking = null; });
+    }
+    return offscreenMaking;
+  });
+}
+
+var downloadsWaiting = {}; // download id -> blob URL to let go of when it's done
+chrome.downloads.onChanged.addListener(function (delta) {
+  var url = downloadsWaiting[delta.id];
+  if (!url || !delta.state || delta.state.current === 'in_progress') return;
+  delete downloadsWaiting[delta.id];
+  chrome.runtime.sendMessage({ target: 'offscreen', action: 'release', url: url }).catch(function () {});
+});
+
+// extra: chunks the page still holds, [{ order, text }], merged in by order.
+function cacheSave(videoId, filename, header, extra) {
+  return offscreenReady().then(function () {
+    return chrome.runtime.sendMessage({ target: 'offscreen', action: 'build', videoId: videoId, header: header, extra: extra });
+  }).then(function (built) {
+    if (!built || !built.url) throw new Error((built && built.error) || 'The file could not be put together.');
+    return chrome.downloads.download({ url: built.url, filename: filename, conflictAction: 'uniquify' }).then(function (id) {
+      downloadsWaiting[id] = built.url;
+      return { ok: true, bytes: built.bytes };
+    });
+  });
+}
+
+// What the page may ask for. youtube.com's own scripts could send these too,
+// so the shapes and sizes are checked.
+var VIDEO_ID = /^[\w-]{11}$/;
+function cacheRequest(msg) {
+  if (!VIDEO_ID.test(msg.videoId || '')) return Promise.resolve({ ok: false, error: 'bad video id' });
+  if (msg.op === 'get') return cacheGet(msg.videoId).then(function (meta) { return { ok: true, meta: meta }; });
+  if (msg.op === 'delete') return cacheDelete(msg.videoId).then(function () { return { ok: true }; });
+  if (msg.op === 'commit') {
+    var part = msg.part, meta = msg.meta;
+    if (!meta || typeof meta !== 'object' || meta.videoId !== msg.videoId || typeof meta.seq !== 'number') return Promise.resolve({ ok: false, error: 'bad note' });
+    if (part && (typeof part.text !== 'string' || typeof part.order !== 'number' || part.text.length > 64 * 1024 * 1024)) return Promise.resolve({ ok: false, error: 'bad chunk' });
+    return cacheCommit(msg.videoId, part || null, meta).then(function () { return { ok: true }; });
+  }
+  if (msg.op === 'save') {
+    var name = String(msg.filename || 'comments.csv').replace(/[\\/:*?"<>|\u0000-\u001f]+/g, ' ').slice(0, 120);
+    var extra = (Array.isArray(msg.extra) ? msg.extra : []).filter(function (x) {
+      return x && typeof x.order === 'number' && typeof x.text === 'string';
+    }).slice(0, 8);
+    return cacheSave(msg.videoId, name, String(msg.header || ''), extra);
+  }
+  return Promise.resolve({ ok: false, error: 'unknown request' });
+}
 
 // ------------------------------------------------------------ Send to Claude
 
@@ -31,7 +162,14 @@ function addRules() {
 function isDevCopy() { return !('update_url' in chrome.runtime.getManifest()); }
 
 chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
-  if (!msg) return;
+  if (!msg || msg.target === 'offscreen') return;
+
+  if (msg.action === 'cache') {
+    cacheRequest(msg).then(sendResponse, function (e) {
+      sendResponse({ ok: false, error: String((e && e.message) || e).slice(0, 200) });
+    });
+    return true; // answering asynchronously
+  }
 
   if (msg.action === 'devReload') {
     if (isDevCopy()) chrome.runtime.reload();

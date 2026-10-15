@@ -36,7 +36,7 @@
   "side_panel": {
     "default_path": "sidepanel.html"
   },
-  "permissions": ["sidePanel", "storage", "scripting", "declarativeNetRequestWithHostAccess"],
+  "permissions": ["sidePanel", "storage", "unlimitedStorage", "scripting", "declarativeNetRequestWithHostAccess", "downloads", "offscreen"],
   "host_permissions": [
     "https://claude.ai/*",
     "https://www.youtube.com/*"

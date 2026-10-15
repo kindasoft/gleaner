@@ -50,6 +50,22 @@
     toExtension({ action: 'sendCancel', reason: typeof d.reason === 'string' ? d.reason.slice(0, 300) : '' });
   });
 
+  // Saved exports, kept by background.js. The page asks with an id and hears
+  // back on scribe:cache-result with the same id.
+  window.addEventListener('scribe:cache', function (e) {
+    var req = null;
+    try { req = JSON.parse(e.detail); } catch (err) {}
+    if (!req || typeof req.id !== 'string' || !newest()) return;
+    function answer(res) {
+      window.dispatchEvent(new CustomEvent('scribe:cache-result', { detail: JSON.stringify({ id: req.id, res: res }) }));
+    }
+    if (!chrome.runtime || !chrome.runtime.id) { answer({ ok: false, error: 'unreachable' }); return; }
+    chrome.runtime.sendMessage({
+      action: 'cache', op: req.op, videoId: req.videoId, part: req.part, meta: req.meta,
+      filename: req.filename, header: req.header, extra: req.extra
+    }).then(function (res) { answer(res || { ok: false, error: 'no answer' }); }, function () { answer({ ok: false, error: 'unreachable' }); });
+  });
+
   // Development only (background.js ignores these in store installs): reload
   // the unpacked copy, switch the side panel's test mode, read its last result.
   window.addEventListener('scribe:dev-reload', function () {

@@ -42,7 +42,9 @@
     download: 'M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z',
     lines: 'M14 17H4v2h10v-2zm6-8H4v2h16V9zM4 15h16v-2H4v2zM4 5v2h16V5H4z',
     stop: 'M6 6h12v12H6z',
-    play: 'M8 5v14l11-7z'
+    play: 'M8 5v14l11-7z',
+    refresh: 'M17.65 6.35A7.96 7.96 0 0012 4a8 8 0 108 8h-2a6 6 0 11-1.76-4.24L13 11h7V4z',
+    trash: 'M6 19a2 2 0 002 2h8a2 2 0 002-2V7H6zM19 4h-3.5l-1-1h-5l-1 1H5v2h14z'
   };
 
   function icon(name, size) {
@@ -805,12 +807,17 @@
   // end or until stop(), and run() again carries on where it stopped. Each
   // run resolves to { finished, stopped, why, comments, replies, rows, total,
   // cut, off, none }: why is 'memory' (the page ran low), 'youtube' (it
-  // stopped answering; another run tries again) or 'loop' (it kept sending
-  // the same comments); cut says some replies didn't load. snapshot() is the
-  // CSV so far as Blobs, each comment followed by its replies, and leaves the
-  // export as it was. onProgress gets (rows read, total from the header,
-  // rows already in the file).
-  function exportComments(videoId, onProgress) {
+  // stopped answering; another run tries again), 'loop' (it kept sending the
+  // same comments) or 'storage' (its progress couldn't be saved); cut says
+  // some replies didn't load. onProgress gets (rows read, total from the
+  // header, rows already in the file).
+  //
+  // With store (the saved exports background.js keeps), each chunk of the
+  // file is saved as soon as it's done, together with a note of where the
+  // reading stands, so another visit can save it again, carry on from the
+  // note (restore), or update() it with just the comments posted since.
+  // Without store, the file stays in this page. save() writes the file.
+  function exportComments(videoId, onProgress, store, restore) {
     var total = 0, count = 0, comments = 0, replies = 0, rows = 0;
     // There's no limit on how many comments an export reads, so nothing big
     // stays in the page's memory: each comment becomes its CSV line as soon as
@@ -822,14 +829,59 @@
     var waiting = {};          // comment id -> its node, until its payload arrives
     var children = { '': [] }; // parent id -> child ids, in the order YouTube shows them
     var pending = {};          // thread id -> "more replies" pages still to read
+    var rootMore = {};         // top comment id -> its first "more replies" links, until it's in the file
     var fetchesPerThread = {};
     var pinnedIds = {};        // only the top list marks the pinned comment
     var waiters = [];          // reply workers with nothing to do yet
-    var parts = [new Blob([String.fromCharCode(0xFEFF) + EXPORT_COLUMNS.join(',') + '\r\n'])];
+    var parts = [];            // without store: the file's chunks, as Blobs
     var buf = [], flushAt = 0;
     // Where the reading stands, kept from one run to the next.
     var begun = false, finished = false, off = false, none = false, cut = false;
     var token = null, queue = [], next = 0, active = 0, pagesDone = false, stopped = false, running = null;
+    // For the saved note: newest comments seen first (an update stops at
+    // them), the latest ones seen (a repeat after carrying on is skipped), and
+    // counts of what's in the file.
+    var firstIds = [], lastIds = [], fileComments = 0, fileReplies = 0;
+    var startedAt = Date.now(), seq = 0, nextOrder = MAIN_ORDER, headBatches = 0;
+    var writes = Promise.resolve(), broken = false;
+    var updating = false, updateLines = null; // an update keeps its rows here until it's done
+
+    if (restore) {
+      startedAt = restore.startedAt || startedAt;
+      total = restore.total || 0;
+      seq = restore.seq || 0;
+      begun = !!restore.begun;
+      finished = !!restore.finished;
+      cut = !!restore.cut;
+      token = restore.token || null;
+      nextOrder = restore.nextOrder || MAIN_ORDER;
+      headBatches = restore.headBatches || 0;
+      rows = restore.rows || 0;
+      fileComments = restore.fileComments || 0;
+      fileReplies = restore.fileReplies || 0;
+      firstIds = (restore.firstIds || []).slice();
+      lastIds = (restore.lastIds || []).slice();
+      (restore.pinned || []).forEach(function (id) { pinnedIds[id] = true; });
+      // Already in the file: if YouTube sends one again, it's skipped. The
+      // pinned comment comes first and again in its place among the oldest
+      // (a carried-on Bloodbark export saved its thread twice before this).
+      firstIds.concat(lastIds, restore.pinned || []).forEach(function (id) { threadOf[id] = id; });
+      // Threads that were still loading start over from their first replies.
+      (restore.unflushed || []).forEach(function (u) {
+        threadOf[u.id] = u.id;
+        children[''].push(u.id);
+        if (typeof u.line === 'string') { lineOf[u.id] = u.line; comments++; }
+        rootMore[u.id] = (u.roots || []).slice();
+        rootMore[u.id].forEach(function (t) {
+          queue.push({ token: t, parent: u.id, thread: u.id });
+          pending[u.id] = (pending[u.id] || 0) + 1;
+        });
+      });
+      comments += fileComments;
+      replies = fileReplies;
+      count = rows + children[''].length;
+    }
+
     function tick() { if (onProgress) onProgress(count, total, rows); }
     // Wakes idle reply workers. They wait on this instead of a timer, because
     // Chrome slows timers in a background tab to about once a minute.
@@ -842,14 +894,15 @@
     }
 
     // Returns the page's "more" links, and how many comments on it were new.
-    function absorb(data, parent) {
-      var byId = {}, added = 0;
+    // items is the page's list, or part of it (an update stops partway).
+    function absorb(data, parent, items) {
+      var byId = {}, added = 0, fresh = {};
       commentPayloads(data).forEach(function (p) {
         var id = p.properties.commentId;
         if (waiting[id]) { finish(waiting[id], p); delete waiting[id]; } else byId[id] = p;
       });
       var out = { nodes: [], more: [] };
-      walkComments(continuationItems(data), parent, out);
+      walkComments(items || continuationItems(data), parent, out);
       out.nodes.forEach(function (n) {
         if (threadOf[n.id] !== undefined) return;
         if (pinnedIds[n.id]) n.pinned = true;
@@ -859,22 +912,93 @@
         if (byId[n.id]) finish(n, byId[n.id]); else waiting[n.id] = n;
         count++;
         added++;
+        fresh[n.id] = true;
+        if (!n.parent) {
+          if (firstIds.length < FIRST_IDS) firstIds.push(n.id);
+          lastIds.push(n.id);
+          if (lastIds.length > LAST_IDS) lastIds.shift();
+        }
       });
-      return { more: out.more, added: added };
+      var more = out.more;
+      if (!parent) {
+        // A top comment's replies are read once: a repeat's links are dropped,
+        // and a new one's are kept, so a later visit can read them again.
+        more = more.filter(function (m) { return !m.parent || fresh[m.parent]; });
+        more.forEach(function (m) { if (m.parent) (rootMore[m.parent] = rootMore[m.parent] || []).push(m.token); });
+      }
+      return { more: more, added: added };
     }
 
     // A comment, then its replies under it, from memory into the file.
     function emit(id) {
       delete waiting[id];
       delete fetchesPerThread[id];
-      if (lineOf[id] !== undefined) { buf.push(lineOf[id]); delete lineOf[id]; rows++; }
+      delete rootMore[id];
+      if (lineOf[id] !== undefined) {
+        buf.push(lineOf[id]);
+        delete lineOf[id];
+        rows++;
+        if (threadOf[id] === id) fileComments++; else fileReplies++;
+      }
       var kids = children[id];
       delete children[id];
       if (kids) kids.forEach(emit);
     }
+
+    // Where the reading stands, for a later visit: everything before the
+    // token is in the file or in the threads still loading, which are kept as
+    // their top comment and the links to their first replies.
+    function note() {
+      var unflushed = [], tops = children[''];
+      for (var i = flushAt; i < tops.length; i++) {
+        if (tops[i] == null) continue;
+        unflushed.push({ id: tops[i], line: lineOf[tops[i]], roots: rootMore[tops[i]] || [] });
+      }
+      return {
+        v: 1, videoId: videoId, seq: ++seq, startedAt: startedAt, updatedAt: Date.now(),
+        title: readDetails(videoId).title || '', total: total, rows: rows,
+        fileComments: fileComments, fileReplies: fileReplies,
+        begun: begun, finished: finished, cut: cut, token: token, nextOrder: nextOrder, headBatches: headBatches,
+        unflushed: unflushed, firstIds: firstIds.slice(), lastIds: lastIds.slice(), pinned: Object.keys(pinnedIds)
+      };
+    }
+
+    // Saves a chunk (or just the note) in the order they happen. A save that
+    // fails three times stops the run: what's saved is still whole, so the
+    // next visit carries on from there.
+    function commit(text, order) {
+      if (!store || broken) return;
+      var part = text ? { order: order !== undefined ? order : nextOrder++, text: text } : null;
+      var meta = note();
+      writes = writes.then(function () {
+        if (broken) return;
+        var tries = 0;
+        return (function attempt() {
+          return store.commit(part, meta).then(function (res) {
+            if (res && res.ok) return;
+            if (++tries >= 3) throw new Error((res && res.error) || 'not saved');
+            return sleep(2000).then(attempt);
+          });
+        })();
+      }).catch(function () {
+        broken = true;
+        stopped = true;
+        wake();
+      });
+    }
+
     function seal() {
-      parts.push(new Blob([buf.join('\r\n') + '\r\n']));
+      if (!buf.length) return;
+      var text = buf.join('\r\n') + '\r\n';
       buf = [];
+      if (updating) updateLines.push(text);
+      else if (store) commit(text);
+      else parts.push(new Blob([text]));
+    }
+    // A checkpoint: what's done goes into the file, with the note.
+    function checkpoint() {
+      if (updating) return;
+      if (buf.length) seal(); else commit(null);
     }
     // Moves every finished thread at the front, in order, into the file. With
     // all, everything left goes: the run is over.
@@ -956,14 +1080,20 @@
       begun = true;
     }
 
+    function startWorkers() {
+      pagesDone = false;
+      var workers = [];
+      for (var w = 0; w < REPLY_WORKERS; w++) workers.push(replyWorker());
+      return workers;
+    }
+
     async function read() {
       stopped = false;
       if (!begun) await begin();
       var why = '';
       if (!finished) {
-        pagesDone = false;
-        var workers = [];
-        for (var w = 0; w < REPLY_WORKERS; w++) workers.push(replyWorker());
+        var timer = store ? setInterval(checkpoint, CHECKPOINT_MS) : null;
+        var workers = startWorkers();
         var page = 0, stale = 0;
         try {
           while (token && !stopped) {
@@ -992,45 +1122,140 @@
         } finally {
           pagesDone = true;
           wake();
+          if (timer) clearInterval(timer);
         }
         await Promise.all(workers);
         if (!stopped && !token && next >= queue.length) { finished = true; flush(true); tick(); }
       }
+      if (!off && !none) {
+        checkpoint();
+        await writes;
+      }
       return {
-        finished: finished, stopped: stopped && !finished, why: why, comments: comments, replies: replies,
-        rows: rows, total: total, cut: cut, off: off, none: none
+        finished: finished, stopped: stopped && !finished, why: broken ? 'storage' : why, comments: comments,
+        replies: replies, rows: rows, total: total, cut: cut, off: off, none: none
       };
     }
 
-    // The file so far: what's already in it, then the threads still loading,
-    // copied without taking them out of memory, so the run can carry on.
-    function snapshot() {
-      if (finished) return { parts: parts.slice(), rows: rows };
-      var lines = buf.slice(), extra = 0;
+    // Only forward: reads "Newest first" from the top, stops at the newest
+    // comments the file already has, and puts what's new above them, in one
+    // chunk once it's all in. A stopped update keeps nothing, so the next one
+    // simply starts again. For a finished export only.
+    async function readUpdate() {
+      stopped = false;
+      var markers = {};
+      firstIds.forEach(function (id) { markers[id] = true; threadOf[id] = id; });
+      var oldFirst = firstIds, startRows = rows;
+      firstIds = []; // fills with this update's newest comments, for the next update
+      updating = true;
+      updateLines = [];
+      var found = await commentsStart(videoId);
+      if (found.state !== 'ok') { updating = false; firstIds = oldFirst; return { update: true, complete: false, off: found.state === 'off', none: found.state !== 'off', added: 0 }; }
+      var first = await withRetry(function () { return innertubeNext(found.token); });
+      total = headerCount(first) || total;
+      var tok = newestToken(first);
+      queue = [];
+      next = 0;
+      var workers = startWorkers();
+      var reachedOld = !tok;
+      try {
+        while (tok && !stopped && !reachedOld) {
+          if (currentVideoId() !== videoId) throw failure('moved', 'moved');
+          var data = await withRetry(function () { return innertubeNext(tok); }, 5);
+          var list = continuationItems(data), cutAt = -1;
+          for (var i = 0; i < list.length && cutAt < 0; i++) {
+            var t = list[i].commentThreadRenderer;
+            var vm = t && t.commentViewModel && t.commentViewModel.commentViewModel;
+            if (vm && markers[vm.commentId]) cutAt = i;
+          }
+          if (cutAt >= 0) { list = list.slice(0, cutAt); reachedOld = true; }
+          var got = absorb(data, '', list);
+          tok = null;
+          if (!reachedOld) got.more.forEach(function (m) { if (!m.parent) tok = m.token; });
+          queueMore(got.more);
+          flush(false);
+          tick();
+        }
+      } finally {
+        pagesDone = true;
+        wake();
+      }
+      await Promise.all(workers);
+      var complete = !stopped && next >= queue.length;
+      flush(true);
+      updating = false;
+      var added = rows - startRows;
+      firstIds = complete ? firstIds.concat(oldFirst).slice(0, FIRST_IDS * 2) : oldFirst;
+      if (complete && updateLines.length) {
+        headBatches++;
+        commit(updateLines.join(''), MAIN_ORDER - headBatches * BATCH_SPAN);
+      } else if (complete) {
+        commit(null); // nothing new: the note still gets the latest total
+      }
+      updateLines = null;
+      await writes;
+      return {
+        update: true, complete: complete && !broken, stopped: stopped, why: broken ? 'storage' : '', added: added,
+        comments: comments, replies: replies, rows: rows, total: total
+      };
+    }
+
+    // The rows not in a saved chunk yet: the last few done, then the threads
+    // still loading, copied without disturbing them.
+    function tail() {
+      var lines = buf.slice(), loading = 0;
       (function walk(ids) {
         ids.forEach(function (id) {
           if (id == null) return;
-          if (lineOf[id] !== undefined) { lines.push(lineOf[id]); extra++; }
+          if (lineOf[id] !== undefined) { lines.push(lineOf[id]); loading++; }
           if (children[id]) walk(children[id]);
         });
       })(children[''].slice(flushAt));
-      var out = parts.slice();
-      if (lines.length) out.push(new Blob([lines.join('\r\n') + '\r\n']));
-      return { parts: out, rows: rows + extra };
+      return { text: lines.length ? lines.join('\r\n') + '\r\n' : '', rows: rows + loading };
     }
 
-    return {
-      run: function () {
-        if (!running) running = read().finally(function () { running = null; });
+    // Writes everything so far to a file in Downloads. Without store it has to
+    // run inside a click (see saveFile).
+    function save(filename) {
+      var t = tail();
+      if (!store) {
+        saveFile(filename, [CSV_HEADER].concat(parts, t.text ? [t.text] : []), 'text/csv;charset=utf-8');
+        return Promise.resolve({ ok: true, rows: t.rows });
+      }
+      return writes.then(function () {
+        // After a failed save of progress, only what's stored is whole.
+        var extra = !broken && t.text ? [{ order: nextOrder, text: t.text }] : [];
+        return store.save(filename, extra);
+      }).then(function (res) {
+        return { ok: !!(res && res.ok), rows: broken ? rows : t.rows, error: res && res.error };
+      });
+    }
+
+    function once(fn) {
+      return function () {
+        if (!running) running = fn().finally(function () { running = null; });
         return running;
-      },
+      };
+    }
+    return {
+      run: once(read),
+      update: once(readUpdate),
       stop: function () { stopped = true; wake(); },
-      snapshot: snapshot
+      save: save,
+      finished: function () { return finished; }
     };
   }
 
+  // Where chunks go in the saved file: the first export's from MAIN_ORDER up,
+  // each update's just below the one before, so newer comments come first.
+  var MAIN_ORDER = 1e9, BATCH_SPAN = 1e5;
+  var FIRST_IDS = 200, LAST_IDS = 200;
+  var CHECKPOINT_MS = 30000; // a long run saves its place at least this often
+
   var EXPORT_COLUMNS = ['video_id', 'comment_id', 'parent_id', 'thread_id', 'reply_level', 'author', 'author_channel_id',
     'text', 'likes', 'replies', 'published', 'edited', 'pinned', 'hearted', 'by_creator'];
+  // With a byte-order mark first, so Excel reads emoji and accents right.
+  var CSV_HEADER = String.fromCharCode(0xFEFF) + EXPORT_COLUMNS.join(',') + '\r\n';
 
   function csvCell(v) {
     var s = v == null ? '' : String(v);
@@ -1210,6 +1435,7 @@
       copy: 'idle', send: 'idle', copyBusy: false, sendBusy: false,
       exportState: 'idle', exportJob: null, exportCount: 0, exportTotal: 0, exportTarget: 0,
       exportStopping: false, exportWritten: 0, exportRunStart: 0, exportBase: 0,
+      exportMode: 'run', exportSaved: null, storeOk: null, overArmed: false,
       note: '', noteBad: false, lastCopyChars: 0
     };
   }
@@ -1294,6 +1520,10 @@
     stop.node.hidden = true;
     var cont = makeButton('sc-tonal', 'play', 'Continue', 'Carry on from where it stopped', continueExport);
     cont.node.hidden = true;
+    var upd = makeButton('sc-tonal', 'refresh', 'Update', 'Add the comments posted since, at the top', updateExport);
+    upd.node.hidden = true;
+    var over = makeButton('sc-tonal', 'trash', 'Start over', 'Delete the saved export of this video', startOver);
+    over.node.hidden = true;
     var send = makeButton('sc-tonal', 'send', 'Send to Claude', "Open Claude in Chrome's side panel and send it everything", doSend);
     var note = el('div', { class: 'sc-note', role: 'status', 'aria-live': 'polite' });
 
@@ -1302,7 +1532,7 @@
         el('span', { class: 'sc-name', text: BRAND }),
         el('div', { class: 'sc-steps' }, [stepT.node, stepD.node, stepC.node])
       ]),
-      el('div', { class: 'sc-row' }, [ask, copy.node, exp.node, stop.node, cont.node, send && send.node]),
+      el('div', { class: 'sc-row' }, [ask, copy.node, exp.node, stop.node, cont.node, upd.node, over.node, send && send.node]),
       note
     ]);
     var panel = el('div', { id: 'scribe-panel', role: 'region', 'aria-label': BRAND }, [
@@ -1314,7 +1544,8 @@
 
     ui.panel = panel;
     ui.refs = {
-      stepT: stepT, stepD: stepD, stepC: stepC, ask: ask, copy: copy, exp: exp, stop: stop, cont: cont, send: send, note: note
+      stepT: stepT, stepD: stepD, stepC: stepC, ask: ask, copy: copy, exp: exp, stop: stop, cont: cont, upd: upd, over: over,
+      send: send, note: note
     };
   }
 
@@ -1403,6 +1634,9 @@
     r.stop.node.hidden = ex !== 'busy';
     setButton(r.stop, ui.exportStopping ? 'busy' : 'idle', ui.exportStopping ? 'Stopping…' : 'Stop');
     r.cont.node.hidden = ui.exportState !== 'paused';
+    r.upd.node.hidden = !(ui.exportState === 'ready' && ui.storeOk && ui.exportSaved && ui.exportSaved.finished);
+    r.over.node.hidden = ui.exportState !== 'ready' && ui.exportState !== 'paused';
+    setButton(r.over, 'idle', ui.overArmed ? 'Sure? Click again' : 'Start over');
 
     r.note.textContent = ui.note;
     r.note.classList.toggle('sc-bad', !!ui.noteBad);
@@ -1573,11 +1807,95 @@
     });
   }
 
+  // ---------------------------------------------------------- saved exports
+  //
+  // background.js keeps every export (see exportComments), so a video's export
+  // can be saved again, continued after the tab is gone, or brought up to date
+  // with just the new comments. The page asks through relay.js.
+
+  var cacheCalls = {}, cacheSeq = 0;
+  window.addEventListener('scribe:cache-result', function (e) {
+    var m = null;
+    try { m = JSON.parse(e.detail); } catch (err) {}
+    var done = m && cacheCalls[m.id];
+    if (!done) return;
+    delete cacheCalls[m.id];
+    done(m.res || { ok: false });
+  });
+  function cacheCall(op, args) {
+    return new Promise(function (resolve) {
+      var id = 'c' + (++cacheSeq);
+      cacheCalls[id] = resolve;
+      setTimeout(function () {
+        if (cacheCalls[id]) { delete cacheCalls[id]; resolve({ ok: false, error: 'no answer' }); }
+      }, 120000);
+      window.dispatchEvent(new CustomEvent('scribe:cache', { detail: JSON.stringify(Object.assign({ id: id, op: op }, args)) }));
+    });
+  }
+  function exportStore(videoId) {
+    return {
+      commit: function (part, meta) { return cacheCall('commit', { videoId: videoId, part: part, meta: meta }); },
+      save: function (filename, extra) {
+        return cacheCall('save', { videoId: videoId, filename: filename, header: CSV_HEADER, extra: extra });
+      }
+    };
+  }
+
+  function whenText(t) {
+    try { return new Date(t).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }); }
+    catch (e) { return ''; }
+  }
+  function savedNote(meta) {
+    var head = 'Saved ' + whenText(meta.updatedAt) + ': ' + fmtNumber(meta.rows + (meta.unflushed || []).length) + ' rows. ';
+    return head + (meta.finished ? 'Save spreadsheet, get new comments with Update, or Start over.' : 'Save spreadsheet, Continue, or Start over.');
+  }
+
+  // When the panel opens: is there a saved export of this video? Without an
+  // answer from the extension, exports stay in the page as before.
+  function loadSaved(st) {
+    if (st.storeOk !== null) return;
+    st.storeOk = false;
+    cacheCall('get', { videoId: st.videoId }).then(function (res) {
+      if (ui !== st) return;
+      st.storeOk = !!(res && res.ok);
+      var meta = res && res.ok ? res.meta : null;
+      if (!meta || st.exportJob || st.exportState !== 'idle') return;
+      st.exportSaved = meta;
+      st.exportState = meta.finished ? 'ready' : 'paused';
+      st.exportCount = meta.rows;
+      st.exportTotal = st.exportTarget = meta.total || 0;
+      setNote(savedNote(meta));
+    });
+  }
+
+  function newJob(st, restore) {
+    var job = exportComments(st.videoId, function (count, total, written) {
+      if (ui !== st || st.exportJob !== job) return;
+      st.exportCount = count;
+      st.exportWritten = written;
+      st.exportTotal = total;
+      st.exportTarget = total;
+      if (st.exportMode === 'update') { render(); return; }
+      var plan = exportPlan(st.exportRunStart, count - st.exportBase, total ? Math.max(0, total - count) : -1);
+      if (!plan.eta || st.exportStopping) { render(); return; }
+      var longNote = st.storeOk ? '. Closing this tab just pauses it: Continue picks up from there later. ' : '. Keep this tab open. ';
+      setNote(plan.eta + (plan.long ? longNote : '. ') + 'Stop anytime to save what has loaded.');
+    }, st.storeOk ? exportStore(st.videoId) : null, restore || null);
+    st.exportJob = job;
+    return job;
+  }
+
+  // The newest saved note, for carrying on or updating from it.
+  function freshSaved(st) {
+    return cacheCall('get', { videoId: st.videoId }).then(function (res) {
+      st.exportSaved = res && res.ok ? res.meta : null;
+      return st.exportSaved;
+    });
+  }
+
   // Export comments: reads every comment. Stop pauses it, Continue carries on
-  // from there, and Save spreadsheet downloads what has loaded, as often as
-  // wanted; the last save after it finishes has everything. Saving needs its
-  // own click, because Chrome only lets a page download a file without asking
-  // right after a click.
+  // from there (also on a later visit), and Save spreadsheet downloads what
+  // has loaded, as often as wanted. Update adds the comments posted since.
   function doExport() {
     var st = ui;
     if (!st) return;
@@ -1587,33 +1905,35 @@
     st.exportTotal = 0;
     st.exportTarget = 0;
     st.exportWritten = 0;
-    var job = st.exportJob = exportComments(st.videoId, function (count, total, written) {
-      if (ui !== st || st.exportJob !== job) return;
-      st.exportCount = count;
-      st.exportWritten = written;
-      st.exportTotal = total;
-      st.exportTarget = total;
-      var plan = exportPlan(st.exportRunStart, count - st.exportBase, total ? Math.max(0, total - count) : -1);
-      if (!plan.eta || st.exportStopping) { render(); return; }
-      setNote(plan.eta + (plan.long ? '. Keep this tab open. ' : '. ') + 'Stop anytime to save what has loaded; you can carry on after.');
-    });
-    runExport(st);
+    newJob(st, null);
+    runExport(st, 'run');
   }
 
-  // Starts the export's reading, or carries it on after a stop.
-  function runExport(st) {
+  // Starts the export's reading, carries it on after a stop, or (mode
+  // 'update') reads just the comments posted since.
+  function runExport(st, mode) {
     var job = st.exportJob;
     st.exportState = 'busy';
+    st.exportMode = mode;
     st.exportStopping = false;
+    st.overArmed = false;
     st.exportRunStart = Date.now();
     st.exportBase = st.exportCount; // the time left is judged on this run's pace
-    setNote('');
-    job.run().then(function (res) {
+    setNote(mode === 'update' ? 'Getting the comments posted since ' + whenText(st.exportSaved ? st.exportSaved.updatedAt : Date.now()) + '…' : '');
+    job[mode]().then(function (res) {
       if (ui !== st || st.exportJob !== job) return;
       st.exportStopping = false;
+      if (res.why === 'storage') {
+        st.exportJob = null; // what's stored is whole; Continue starts from it
+        st.exportState = 'paused';
+        setNote(BRAND + " couldn't save its progress. Refresh the page, then press Continue.", true);
+        return;
+      }
+      if (res.update) { updated(st, res); return; }
       if (res.off || res.none || (res.finished && !res.rows)) {
         st.exportJob = null;
         st.exportState = 'idle';
+        if (st.storeOk) cacheCall('delete', { videoId: st.videoId });
         setNote(res.off ? 'Comments are turned off for this video.' : res.none ? 'This video has no comments section.' : 'This video has no comments yet.');
         return;
       }
@@ -1623,20 +1943,31 @@
         if (res.why === 'loop') setNote('YouTube kept sending the same comments, so the export ended at ' + counts + '. Click Save spreadsheet to download them.', true);
         else if (res.cut) setNote(counts + ". A few replies didn't load. Click Save spreadsheet to download them.");
         else setNote(counts + '. Click Save spreadsheet to download them.');
+        if (st.storeOk) freshSaved(st).then(function () { if (ui === st) render(); });
         return;
       }
       st.exportState = 'paused';
       if (res.why === 'memory') setNote('Paused at ' + counts + ' because your browser is low on memory. Click Save spreadsheet to download them.', true);
       else if (res.why === 'youtube') setNote('YouTube stopped answering at ' + counts + '. Save what has loaded, or Continue to try again.', true);
-      else setNote('Paused at ' + counts + '. Save what has loaded, or Continue to keep going.');
+      else setNote('Paused at ' + counts + '. Save what has loaded, or Continue to keep going' + (st.storeOk ? ', now or another day.' : '.'));
     }, function (e) {
       if (ui !== st || st.exportJob !== job) return;
       st.exportJob = null;
       st.exportStopping = false;
-      st.exportState = e && e.code === 'moved' ? 'idle' : 'fail';
-      if (st.exportState === 'fail') setNote("The export didn't work: " + plainError(e) + ' Click Export comments to try again.', true);
-      else render();
+      if (e && e.code === 'moved') { st.exportState = 'idle'; render(); return; }
+      st.exportState = 'fail';
+      setNote("The export didn't work: " + plainError(e) + ' Click Export comments to try again.', true);
     });
+  }
+
+  function updated(st, res) {
+    st.exportJob = null; // the next step starts from the saved note
+    st.exportState = 'ready';
+    freshSaved(st).then(function () { if (ui === st) render(); });
+    if (res.off || res.none) setNote(res.off ? 'Comments are turned off for this video now.' : 'This video has no comments section now.', true);
+    else if (!res.complete) setNote('Update stopped, and nothing was added. Update again anytime.');
+    else if (!res.added) setNote('No new comments since ' + whenText(st.exportSaved ? st.exportSaved.updatedAt : Date.now()) + '.');
+    else setNote('Added ' + fmtNumber(res.added) + ' new rows, at the top. Save spreadsheet to get everything.');
   }
 
   // The Stop button (or Export clicked again while it runs): pauses the
@@ -1651,22 +1982,68 @@
 
   function continueExport() {
     var st = ui;
-    if (!st || st.exportState !== 'paused' || !st.exportJob) return;
-    runExport(st);
+    if (!st || st.exportState !== 'paused') return;
+    if (st.exportJob) { runExport(st, 'run'); return; }
+    // A saved export from an earlier visit: carry on from its note.
+    freshSaved(st).then(function (meta) {
+      if (ui !== st || st.exportState !== 'paused' || st.exportJob) return;
+      if (!meta) { st.exportState = 'idle'; setNote('The saved export is gone. Click Export comments to start again.', true); return; }
+      newJob(st, meta);
+      runExport(st, 'run');
+    });
+  }
+
+  function updateExport() {
+    var st = ui;
+    if (!st || st.exportState !== 'ready' || !st.storeOk) return;
+    freshSaved(st).then(function (meta) {
+      if (ui !== st || st.exportState !== 'ready' || !meta || !meta.finished) return;
+      newJob(st, meta);
+      runExport(st, 'update');
+    });
+  }
+
+  // Start over deletes the saved export, so it takes a second click.
+  function startOver() {
+    var st = ui;
+    if (!st || (st.exportState !== 'ready' && st.exportState !== 'paused')) return;
+    if (!st.overArmed) {
+      st.overArmed = true;
+      render();
+      setTimeout(function () { if (ui === st && st.overArmed) { st.overArmed = false; render(); } }, 4000);
+      return;
+    }
+    st.overArmed = false;
+    var hadSaved = st.storeOk;
+    st.exportJob = null;
+    st.exportSaved = null;
+    st.exportState = 'idle';
+    st.exportCount = st.exportTotal = st.exportTarget = st.exportWritten = 0;
+    setNote(hadSaved ? 'Deleting the saved export…' : '');
+    if (hadSaved) cacheCall('delete', { videoId: st.videoId }).then(function (res) {
+      if (ui === st) setNote(res && res.ok ? 'The saved export is deleted. Click Export comments to start again.' : "Couldn't delete the saved export. Try again.", !(res && res.ok));
+    });
   }
 
   function saveExport(st) {
-    if (!st.exportJob) return;
-    var snap = st.exportJob.snapshot();
-    saveFile(safeFileName(readDetails(st.videoId).title) + ' - comments.csv', snap.parts, 'text/csv;charset=utf-8');
-    if (st.exportState === 'paused') {
-      setNote('Saved ' + fmtNumber(snap.rows) + ' rows so far. Continue anytime to get the rest.');
-      return;
-    }
-    st.exportState = 'done';
-    st.exportJob = null;
-    setNote('Saved ' + fmtNumber(snap.rows) + ' rows. The file is in your downloads.');
-    setTimeout(function () { if (ui === st && st.exportState === 'done') { st.exportState = 'idle'; render(); } }, 2400);
+    var job = st.exportJob;
+    if (!job && st.exportSaved) job = newJob(st, st.exportSaved); // saved earlier: just write the file
+    if (!job) return;
+    var paused = st.exportState === 'paused';
+    setNote('Saving…');
+    job.save(safeFileName(readDetails(st.videoId).title || (st.exportSaved && st.exportSaved.title)) + ' - comments.csv').then(function (res) {
+      if (ui !== st) return;
+      if (!res.ok) { setNote("Couldn't save the file: " + (res.error || 'something went wrong') + '. Try again.', true); return; }
+      if (paused) { setNote('Saved ' + fmtNumber(res.rows) + ' rows so far. Continue anytime to get the rest.'); return; }
+      st.exportState = 'done';
+      setNote('Saved ' + fmtNumber(res.rows) + ' rows. The file is in your downloads.');
+      setTimeout(function () {
+        if (ui !== st || st.exportState !== 'done') return;
+        // A saved export stays, ready to save again or update.
+        if (st.storeOk) st.exportState = 'ready'; else { st.exportState = 'idle'; st.exportJob = null; }
+        render();
+      }, 2400);
+    });
   }
 
   function dispatchSend(prompt, question) {
@@ -1779,6 +2156,7 @@
       void ui.panel.offsetHeight; // paint the closed state first so it animates open
       ui.panel.classList.add('sc-open');
       startLoading();
+      loadSaved(ui);
     } else if (ui.panel) {
       // Out of the Tab order, clicks and screen readers while closed.
       ui.panel.inert = true;
