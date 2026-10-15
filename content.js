@@ -40,7 +40,8 @@
     cross: 'M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z',
     dash: 'M19 13H5v-2h14v2z',
     download: 'M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z',
-    lines: 'M14 17H4v2h10v-2zm6-8H4v2h16V9zM4 15h16v-2H4v2zM4 5v2h16V5H4z'
+    lines: 'M14 17H4v2h10v-2zm6-8H4v2h16V9zM4 15h16v-2H4v2zM4 5v2h16V5H4z',
+    stop: 'M6 6h12v12H6z'
   };
 
   function icon(name, size) {
@@ -689,9 +690,10 @@
   // Every comment and reply on a video, for a spreadsheet. Unlike the copied
   // text it follows every page, including each thread's "more replies".
 
-  var MAX_EXPORT_PAGES = 10000; // about 200,000 top comments
-  var EXPORT_CAP_TEXT = '200,000';
-  var MAX_REPLY_PAGES = 256;  // per thread; a page holds about 10 replies signed in, 45 signed out
+  // Per thread, only to end a "more replies" chain that never ends; a page
+  // holds about 10 replies signed in, 45 signed out.
+  var MAX_REPLY_PAGES = 10000;
+  var CSV_PART_ROWS = 5000; // rows per Blob part of the file
 
   // True when the page's memory is getting close to Chrome's limit (Chrome
   // only; elsewhere it never stops an export).
@@ -782,42 +784,44 @@
     });
   }
 
-  // Where a running export is headed: target is the rows it will likely end
-  // with (the header's total, or what the page cap holds on a huge video,
-  // judged by the replies-per-comment seen so far), capped says the cap will
-  // end it, and eta reads like "about 25 min left" once there's enough to go on.
-  function exportPlan(started, count, total, comments) {
-    var capRows = MAX_EXPORT_PAGES * 20 * (comments ? count / comments : 1);
-    var capped = total > capRows;
-    var target = capped ? Math.round(capRows / 1000) * 1000 : total;
-    var secs = (Date.now() - started) / 1000, eta = '';
-    if (target && secs >= 10 && count >= 200) {
-      var left = Math.max(0, target - count) / (count / secs);
+  // Where a running export is headed: target is the header's total, eta
+  // reads like "about 25 min left" once there's enough to go on, and long
+  // says there's more than half an hour to go.
+  function exportPlan(started, count, total) {
+    var secs = (Date.now() - started) / 1000, eta = '', left = 0;
+    if (total && secs >= 10 && count >= 200) {
+      left = Math.max(0, total - count) / (count / secs);
       var mins = Math.round(left / 60);
       if (left < 45) eta = 'Under a minute left';
       else if (mins < 60) eta = 'About ' + Math.max(1, mins) + ' min left';
       else eta = 'About ' + Math.floor(mins / 60) + ' h' + (mins % 60 ? ' ' + (mins % 60) + ' min' : '') + ' left';
     }
-    return { target: target, capped: capped, eta: eta };
+    return { target: total, eta: eta, long: left > 1800 };
   }
 
-  // Resolves to { lines, comments, replies, total, complete, stopped, capped }
-  // once done or stopped: lines are the CSV rows in order, each reply under
-  // its parent; capped is 'pages' or 'memory' when a limit ended it. onProgress
-  // gets (rows so far, total from the header, top comments so far). stop()
-  // ends it early and keeps what loaded.
+  // Resolves to { parts, rows, comments, replies, total, complete, stopped,
+  // capped } once done or stopped: parts is the CSV file as Blobs, each
+  // comment followed by its replies; capped is 'memory' when the page ran low
+  // on memory. onProgress gets (rows so far, total from the header, rows
+  // already in the file). stop() ends it early and keeps what loaded.
   function exportComments(videoId, onProgress) {
-    var stopped = false, total = 0, count = 0, comments = 0, replies = 0, capped = '';
-    // A huge video can have hundreds of thousands of comments, so each one is
-    // turned into its CSV line as soon as it arrives and YouTube's bulky
-    // payload is dropped.
-    var threadOf = {};         // comment id -> the id of its thread
-    var lineOf = {};           // comment id -> its CSV line
+    var stopped = false, total = 0, count = 0, comments = 0, replies = 0, rows = 0, capped = '';
+    // There's no limit on how many comments an export reads, so nothing big
+    // stays in the page's memory: each comment becomes its CSV line as soon as
+    // it arrives (YouTube's bulky payload is dropped), and each thread moves
+    // into the file as soon as all its replies are in. The file is a list of
+    // Blobs, which Chrome keeps outside the page's memory, on disk when big.
+    var threadOf = {};         // comment id -> the id of its thread; also what's been seen
+    var lineOf = {};           // comment id -> its CSV line, until it's in the file
     var waiting = {};          // comment id -> its node, until its payload arrives
     var children = { '': [] }; // parent id -> child ids, in the order YouTube shows them
+    var pending = {};          // thread id -> "more replies" pages still to read
+    var fetchesPerThread = {};
     var pinnedIds = {};        // only the top list marks the pinned comment
     var waiters = [];          // reply workers with nothing to do yet
-    function tick() { if (onProgress) onProgress(count, total, comments); }
+    var parts = [new Blob(['﻿' + EXPORT_COLUMNS.join(',') + '\r\n'])];
+    var buf = [], flushAt = 0;
+    function tick() { if (onProgress) onProgress(count, total, rows); }
     // Wakes idle reply workers. They wait on this instead of a timer, because
     // Chrome slows timers in a background tab to about once a minute.
     function wake() { var w = waiters; waiters = []; w.forEach(function (f) { f(); }); }
@@ -828,8 +832,9 @@
       if (row.reply_level > 0) replies++; else comments++;
     }
 
+    // Returns the page's "more" links, and how many comments on it were new.
     function absorb(data, parent) {
-      var byId = {};
+      var byId = {}, added = 0;
       commentPayloads(data).forEach(function (p) {
         var id = p.properties.commentId;
         if (waiting[id]) { finish(waiting[id], p); delete waiting[id]; } else byId[id] = p;
@@ -844,24 +849,57 @@
         (children[n.parent] = children[n.parent] || []).push(n.id);
         if (byId[n.id]) finish(n, byId[n.id]); else waiting[n.id] = n;
         count++;
+        added++;
       });
-      return out.more;
+      return { more: out.more, added: added };
+    }
+
+    // A comment, then its replies under it, from memory into the file.
+    function emit(id) {
+      delete waiting[id];
+      delete fetchesPerThread[id];
+      if (lineOf[id] !== undefined) { buf.push(lineOf[id]); delete lineOf[id]; rows++; }
+      var kids = children[id];
+      delete children[id];
+      if (kids) kids.forEach(emit);
+    }
+    function seal() {
+      parts.push(new Blob([buf.join('\r\n') + '\r\n']));
+      buf = [];
+    }
+    // Moves every finished thread at the front, in order, into the file. With
+    // all, everything left goes: the run is over.
+    function flush(all) {
+      var tops = children[''];
+      while (flushAt < tops.length && (all || !pending[tops[flushAt]])) {
+        emit(tops[flushAt]);
+        tops[flushAt++] = null;
+        if (buf.length >= CSV_PART_ROWS) seal();
+      }
+      if (flushAt > 50000) { children[''] = tops.slice(flushAt); flushAt = 0; }
+      if (all && buf.length) seal();
     }
 
     var job = (async function () {
       var found = await commentsStart(videoId);
-      if (found.state !== 'ok') return { lines: [], comments: 0, replies: 0, total: 0, complete: true, off: found.state === 'off', none: found.state === 'nosection' };
+      if (found.state !== 'ok') return { parts: [], rows: 0, comments: 0, replies: 0, total: 0, complete: true, off: found.state === 'off', none: found.state === 'nosection' };
 
       // "More replies" links, from top-level pages and from reply pages alike.
-      var queue = [], next = 0, active = 0, pagesDone = false, complete = true, fetchesPerThread = {};
+      var queue = [], next = 0, active = 0, pagesDone = false, complete = true;
       function queueMore(list) {
         var added = false;
         list.forEach(function (m) {
           if (!m.parent) return;
-          queue.push({ token: m.token, parent: m.parent, thread: threadOf[m.parent] !== undefined ? threadOf[m.parent] : m.parent });
+          var thread = threadOf[m.parent] !== undefined ? threadOf[m.parent] : m.parent;
+          queue.push({ token: m.token, parent: m.parent, thread: thread });
+          pending[thread] = (pending[thread] || 0) + 1;
           added = true;
         });
         if (added) wake();
+      }
+      function done(thread) {
+        if (!--pending[thread]) delete pending[thread];
+        flush(false);
       }
       async function replyWorker() {
         for (;;) {
@@ -869,16 +907,17 @@
           if (next < queue.length) {
             var q = queue[next];
             queue[next++] = null; // let a long run's done items go
-            if ((fetchesPerThread[q.thread] = (fetchesPerThread[q.thread] || 0) + 1) > MAX_REPLY_PAGES) { complete = false; continue; }
+            if ((fetchesPerThread[q.thread] = (fetchesPerThread[q.thread] || 0) + 1) > MAX_REPLY_PAGES) { complete = false; done(q.thread); continue; }
             active++;
             try {
               var rd = await withRetry(function () { return innertubeNext(q.token); }, 2);
-              queueMore(absorb(rd, q.parent));
+              queueMore(absorb(rd, q.parent).more);
               tick();
             } catch (e) {
               complete = false;
             } finally {
               active--;
+              done(q.thread);
               wake();
             }
           } else if (pagesDone && !active) {
@@ -891,7 +930,7 @@
       var workers = [];
       for (var w = 0; w < REPLY_WORKERS; w++) workers.push(replyWorker());
 
-      var token = null, page = 0;
+      var token = null, page = 0, stale = 0;
       try {
         // YouTube's "Top comments" list ends near 1,000 comments on a big video
         // (988 of 9,757 on Sintel, checked 8 Oct 2026); "Newest first" runs to
@@ -905,30 +944,34 @@
         token = newestToken(first);
         if (!token) {
           // No sort menu: fall back to the top list, from the page in hand.
-          var more0 = absorb(first, '');
+          var more0 = absorb(first, '').more;
           more0.forEach(function (m) { if (!m.parent) token = m.token; });
           queueMore(more0);
+          flush(false);
           page = 1;
           tick();
         }
         while (token && !stopped) {
           if (currentVideoId() !== videoId) throw failure('moved', 'moved');
-          if (++page > MAX_EXPORT_PAGES) { complete = false; capped = 'pages'; break; }
-          if (page % 25 === 0 && memoryTight()) { complete = false; capped = 'memory'; break; }
+          // Stops short of a crash if the page's memory fills anyway.
+          if (++page % 25 === 0 && memoryTight()) { complete = false; capped = 'memory'; break; }
           var data;
           try {
             // A long run meets the odd hiccup, so a page gets a few more tries.
             data = await withRetry(function () { return innertubeNext(token); }, 5);
           } catch (e) {
-            if (!children[''].length) throw e;
+            if (!count) throw e;
             complete = false; // keep what already loaded
             break;
           }
           if (!total) total = headerCount(data);
-          var more = absorb(data, '');
+          var got = absorb(data, '');
           token = null;
-          more.forEach(function (m) { if (!m.parent) token = m.token; }); // the next page of top comments
-          queueMore(more);
+          got.more.forEach(function (m) { if (!m.parent) token = m.token; }); // the next page of top comments
+          queueMore(got.more);
+          // Pages with nothing new, over and over, mean YouTube is going in circles.
+          if (got.added) stale = 0; else if (++stale >= 5) { complete = false; break; }
+          flush(false);
           tick();
         }
       } finally {
@@ -937,16 +980,8 @@
       }
       await Promise.all(workers);
       if (stopped || next < queue.length) complete = false;
-
-      // Each comment, then its replies under it, in the order YouTube shows them.
-      var lines = [];
-      (function add(parent) {
-        (children[parent] || []).forEach(function (id) {
-          if (lineOf[id] !== undefined) lines.push(lineOf[id]);
-          add(id);
-        });
-      })('');
-      return { lines: lines, comments: comments, replies: replies, total: total, complete: complete, stopped: stopped, capped: capped };
+      flush(true);
+      return { parts: parts, rows: rows, comments: comments, replies: replies, total: total, complete: complete, stopped: stopped, capped: capped };
     })();
     job.stop = function () { stopped = true; wake(); };
     return job;
@@ -965,15 +1000,6 @@
 
   function csvLine(row) {
     return EXPORT_COLUMNS.map(function (k) { return csvCell(row[k]); }).join(',');
-  }
-
-  // The CSV file as Blob parts, with a byte-order mark so Excel reads emoji
-  // and accents right. Parts of a few thousand lines each, so a huge export
-  // never has to sit in memory as one giant string.
-  function csvParts(lines) {
-    var parts = ['\uFEFF' + EXPORT_COLUMNS.join(',') + '\r\n'];
-    for (var i = 0; i < lines.length; i += 5000) parts.push(lines.slice(i, i + 5000).join('\r\n') + '\r\n');
-    return parts;
   }
 
   function safeFileName(s) {
@@ -1141,6 +1167,7 @@
       transcript: { state: 'idle' }, details: { state: 'idle' }, comments: { state: 'idle' },
       copy: 'idle', send: 'idle', copyBusy: false, sendBusy: false,
       exportState: 'idle', exportJob: null, exportResult: null, exportCount: 0, exportTotal: 0, exportTarget: 0,
+      exportStopping: false, exportWritten: 0,
       note: '', noteBad: false, lastCopyChars: 0
     };
   }
@@ -1221,6 +1248,8 @@
 
     var copy = makeButton('sc-primary', 'copy', 'Copy', 'Copy the details, transcript and comments', doCopy);
     var exp = makeButton('sc-tonal', 'download', 'Export comments', '', doExport);
+    var stop = makeButton('sc-tonal', 'stop', 'Stop', 'Stop here and keep what has loaded', stopExport);
+    stop.node.hidden = true;
     var send = makeButton('sc-tonal', 'send', 'Send to Claude', "Open Claude in Chrome's side panel and send it everything", doSend);
     var note = el('div', { class: 'sc-note', role: 'status', 'aria-live': 'polite' });
 
@@ -1229,7 +1258,7 @@
         el('span', { class: 'sc-name', text: BRAND }),
         el('div', { class: 'sc-steps' }, [stepT.node, stepD.node, stepC.node])
       ]),
-      el('div', { class: 'sc-row' }, [ask, copy.node, exp.node, send && send.node]),
+      el('div', { class: 'sc-row' }, [ask, copy.node, exp.node, stop.node, send && send.node]),
       note
     ]);
     var panel = el('div', { id: 'scribe-panel', role: 'region', 'aria-label': BRAND }, [
@@ -1241,7 +1270,7 @@
 
     ui.panel = panel;
     ui.refs = {
-      stepT: stepT, stepD: stepD, stepC: stepC, ask: ask, copy: copy, exp: exp, send: send, note: note
+      stepT: stepT, stepD: stepD, stepC: stepC, ask: ask, copy: copy, exp: exp, stop: stop, send: send, note: note
     };
   }
 
@@ -1326,6 +1355,8 @@
     r.exp.node.title = ex === 'busy' ? "Click to stop and keep what's loaded"
       : ex === 'ready' ? 'Download the comments as a CSV file (opens in Excel or Google Sheets)'
       : 'Every comment and reply on this video, as a spreadsheet';
+    r.stop.node.hidden = ex !== 'busy';
+    setButton(r.stop, ui.exportStopping ? 'busy' : 'idle', ui.exportStopping ? 'Stopping…' : 'Stop');
 
     r.note.textContent = ui.note;
     r.note.classList.toggle('sc-bad', !!ui.noteBad);
@@ -1502,29 +1533,31 @@
   function doExport() {
     var st = ui;
     if (!st) return;
-    if (st.exportState === 'busy') { if (st.exportJob) st.exportJob.stop(); return; }
+    if (st.exportState === 'busy') { stopExport(); return; }
     if (st.exportState === 'ready') { saveExport(st); return; }
     st.exportState = 'busy';
+    st.exportStopping = false;
     st.exportCount = 0;
     st.exportTotal = 0;
     st.exportTarget = 0;
+    st.exportWritten = 0;
     var started = Date.now();
     setNote('');
-    var job = st.exportJob = exportComments(st.videoId, function (count, total, comments) {
+    var job = st.exportJob = exportComments(st.videoId, function (count, total, written) {
       if (ui !== st || st.exportJob !== job) return;
-      var plan = exportPlan(started, count, total, comments);
+      var plan = exportPlan(started, count, total);
       st.exportCount = count;
+      st.exportWritten = written;
       st.exportTotal = total;
       st.exportTarget = plan.target;
-      if (!plan.eta) { render(); return; }
-      setNote(plan.capped
-        ? 'This video has ' + fmtNumber(total) + ' comments. ' + BRAND + ' reads up to about ' + EXPORT_CAP_TEXT + ' of them, plus their replies. ' + plan.eta + '.'
-        : plan.eta + '. Click the button again to stop and keep what has loaded.');
+      if (!plan.eta || st.exportStopping) { render(); return; }
+      setNote(plan.eta + (plan.long ? '. Keep this tab open. ' : '. ') + 'Stop anytime and save what has loaded.');
     });
     job.then(function (res) {
       if (ui !== st || st.exportJob !== job) return;
       st.exportJob = null;
-      if (res.off || res.none || !res.lines.length) {
+      st.exportStopping = false;
+      if (res.off || res.none || !res.rows) {
         st.exportState = 'idle';
         setNote(res.off ? 'Comments are turned off for this video.' : res.none ? 'This video has no comments section.' : 'This video has no comments yet.');
         return;
@@ -1533,26 +1566,36 @@
       st.exportState = 'ready';
       var counts = fmtNumber(res.comments) + ' comments and ' + fmtNumber(res.replies) + ' replies';
       if (res.complete) setNote(counts + '. Click Save spreadsheet to download them.');
-      else if (res.stopped) setNote('Stopped at ' + counts + '. Click Save spreadsheet to download what loaded.');
-      else if (res.capped === 'pages') setNote(BRAND + ' stops at about ' + EXPORT_CAP_TEXT + ' comments. Got ' + counts + '. Click Save spreadsheet to download them.');
+      else if (res.stopped) setNote('Stopped at ' + counts + '. Click Save spreadsheet to download them.');
       else if (res.capped === 'memory') setNote('Stopped at ' + counts + ' before your browser ran low on memory. Click Save spreadsheet to download them.');
       else setNote('YouTube stopped answering at ' + counts + '. Click Save spreadsheet to download what loaded, or Export again later.', true);
     }, function (e) {
       if (ui !== st || st.exportJob !== job) return;
       st.exportJob = null;
+      st.exportStopping = false;
       st.exportState = e && e.code === 'moved' ? 'idle' : 'fail';
       if (st.exportState === 'fail') setNote("The export didn't work: " + plainError(e) + ' Click Export comments to try again.', true);
       else render();
     });
   }
 
+  // The Stop button (or Export clicked again): ends the export, and what has
+  // loaded becomes the spreadsheet.
+  function stopExport() {
+    var st = ui;
+    if (!st || st.exportState !== 'busy' || !st.exportJob || st.exportStopping) return;
+    st.exportStopping = true;
+    st.exportJob.stop();
+    setNote('Stopping…');
+  }
+
   function saveExport(st) {
     var res = st.exportResult;
     if (!res) return;
-    saveFile(safeFileName(readDetails(st.videoId).title) + ' - comments.csv', csvParts(res.lines), 'text/csv;charset=utf-8');
+    saveFile(safeFileName(readDetails(st.videoId).title) + ' - comments.csv', res.parts, 'text/csv;charset=utf-8');
     st.exportState = 'done';
     st.exportResult = null;
-    setNote('Saved ' + fmtNumber(res.lines.length) + ' rows. The file is in your downloads.');
+    setNote('Saved ' + fmtNumber(res.rows) + ' rows. The file is in your downloads.');
     setTimeout(function () { if (ui === st && st.exportState === 'done') { st.exportState = 'idle'; render(); } }, 2400);
   }
 
@@ -1836,7 +1879,9 @@
       comments: ui.comments.state, commentCount: ui.comments.count || 0, replyCount: ui.comments.replies || 0,
       copy: ui.copy, send: ui.send, note: ui.note, lastCopyChars: ui.lastCopyChars,
       exportState: ui.exportState, exportCount: ui.exportCount, exportTotal: ui.exportTotal,
-      exportRows: ui.exportResult ? ui.exportResult.lines.length : 0,
+      exportWritten: ui.exportWritten, // rows already in the file, out of the page's memory
+      exportRows: ui.exportResult ? ui.exportResult.rows : 0,
+      heapMB: window.performance && performance.memory ? Math.round(performance.memory.usedJSHeapSize / 1048576) : null,
       build: BUILD
     };
   };

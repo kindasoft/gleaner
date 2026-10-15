@@ -7,7 +7,7 @@ Copy any YouTube video's transcript, details and comments for your AI in one cli
 ## What it does
 - **Copy**: one block of text with the video's details (title, channel, date, views, likes, tags, description, chapters), the full transcript with timestamps, and up to 320 top comments with their replies. If you type a question, it goes at the end.
 - **Send to Claude**: opens claude.ai in Chrome's side panel, next to the video, and sends it everything, in your own Claude account.
-- **Export comments**: every comment and every reply on a video (up to about 200,000 comments) as a CSV file for Excel, Google Sheets or Numbers. Each reply sits under the comment it answers.
+- **Export comments**: every comment and every reply on a video, however many there are, as a CSV file for Excel, Google Sheets or Numbers. Each reply sits under the comment it answers. A huge video takes hours, so Stop ends it anytime and keeps what has loaded.
 - **Shorts**: a button on Shorts opens the Short as a normal video with the panel ready.
 
 No API key, no account, no servers and no tracking.
