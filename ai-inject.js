@@ -1,10 +1,10 @@
-// Runs inside the claude.ai frame that Scribe's side panel opens. Waits for
+// Runs inside the claude.ai frame that Gleaner's side panel opens. Waits for
 // the message box, pastes the video in, adds the question and presses send.
 // Runs in the page's own context (manifest "world": "MAIN") so it can use the
 // editor's API; it talks to the side panel only by postMessage.
 (function() {
-  if (window.top === window.self) return; // only inside Scribe's side panel frame
-  // ...and only when an extension page (Scribe's side panel) is the direct
+  if (window.top === window.self) return; // only inside Gleaner's side panel frame
+  // ...and only when an extension page (Gleaner's side panel) is the direct
   // parent. A website that frames claude.ai, or an app or artifact frame
   // inside Claude, must never be able to make this script paste and send.
   var parentOrigin = (location.ancestorOrigins && location.ancestorOrigins[0]) || '';

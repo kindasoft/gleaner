@@ -66,6 +66,14 @@
     }).then(function (res) { answer(res || { ok: false, error: 'no answer' }); }, function () { answer({ ok: false, error: 'unreachable' }); });
   });
 
+  // The clip cutter: background.js puts lib/mediabunny.js into this page.
+  window.addEventListener('scribe:clip-engine', function () {
+    if (!newest()) return;
+    toExtension({ action: 'clipEngine' }, function (res) {
+      window.dispatchEvent(new CustomEvent('scribe:clip-engine-result', { detail: JSON.stringify(res || { ok: false }) }));
+    });
+  });
+
   // Development only (background.js ignores these in store installs): reload
   // the unpacked copy, switch the side panel's test mode, read its last result.
   window.addEventListener('scribe:dev-reload', function () {

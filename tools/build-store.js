@@ -1,10 +1,12 @@
-// Builds the Chrome Web Store copy (Gleaner) from the same source as the
-// unpacked copy in this folder. Run from the project folder:
+// Builds the Chrome Web Store copy from the same source as the unpacked copy
+// in this folder. Run from the project folder:
 //   node tools/build-store.js
 // Output: dist/store/ (load it unpacked to test) and dist/<brand>-<version>.zip
 // (upload that one). The differences from the unpacked copy:
-//   - its own name, from tools/store.json, and its own icons, from store/icons
+//   - its store name, short name and description, from tools/store.json
 //   - the question box says "Add a question" and Enter copies
+//   - no clips: the Chrome Web Store bans YouTube downloads, so CLIPS is off
+//     and media-keeper.js and lib/ (the clip cutter) stay out
 const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
@@ -30,7 +32,8 @@ function swap(source, from, to, file) {
 
 let content = fs.readFileSync(path.join(ROOT, 'content.js'), 'utf8');
 content = swap(content, "var BUILD = 'dev';", "var BUILD = 'store';", 'content.js');
-content = swap(content, "var BRAND = 'Scribe';", 'var BRAND = ' + JSON.stringify(config.brand) + ';', 'content.js');
+content = swap(content, "var BRAND = 'Gleaner';", 'var BRAND = ' + JSON.stringify(config.brand) + ';', 'content.js');
+content = swap(content, 'var CLIPS = true;', 'var CLIPS = false;', 'content.js');
 
 // Every swap worked, so only now is the last build replaced (the copy loaded in
 // Chrome keeps working if a check above stops the build).
@@ -42,7 +45,7 @@ fs.writeFileSync(path.join(OUT, 'content.js'), content);
 for (const f of ['background.js', 'relay.js', 'sidepanel.html', 'sidepanel.js', 'ai-inject.js', 'offscreen.html', 'offscreen.js', 'LICENSE']) {
   fs.copyFileSync(path.join(ROOT, f), path.join(OUT, f));
 }
-// The store copy has its own icons (the wheat stalk); the unpacked copy keeps Scribe's.
+// The icons (the wheat stalk), the same as the unpacked copy's.
 for (const size of [16, 32, 48, 128]) {
   fs.copyFileSync(path.join(ROOT, 'store', 'icons', 'icon' + size + '.png'), path.join(OUT, 'icons', 'icon' + size + '.png'));
 }
@@ -55,8 +58,9 @@ const manifest = {
   minimum_chrome_version: devManifest.minimum_chrome_version,
   description: config.description,
   icons: devManifest.icons,
-  // Same scripts, permissions and side panel as the unpacked copy (Send to Claude included).
-  content_scripts: devManifest.content_scripts,
+  // Same scripts, permissions and side panel as the unpacked copy (Send to
+  // Claude included), less the media keeper that clips need.
+  content_scripts: devManifest.content_scripts.filter(function (cs) { return cs.js.indexOf('media-keeper.js') < 0; }),
   background: devManifest.background,
   side_panel: devManifest.side_panel,
   permissions: devManifest.permissions,

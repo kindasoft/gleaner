@@ -1,17 +1,18 @@
-// Scribe: copy a YouTube video's transcript, details and comments in one click,
+// Gleaner: copy a YouTube video's transcript, details and comments in one click,
 // or send them to Claude. Runs in YouTube's own page context (manifest
 // "world": "MAIN") so it can read the player and page data. Anything that
 // needs chrome.* APIs goes through relay.js.
 (function () {
   'use strict';
   if (window.__scribe) return;
-  var scribe = window.__scribe = { version: '3.2' };
+  var scribe = window.__scribe = { version: '3.3' };
 
   // 'dev' is the copy loaded unpacked from this folder (Enter in the question
   // box sends to Claude). tools/build-store.js makes the Chrome Web Store copy:
-  // 'store' (Enter copies) and its own name.
+  // 'store' (Enter copies). Gleaner was called Scribe at first, so the code's
+  // own names (window.__scribe, the scribe: events, #scribe-pill) still say so.
   var BUILD = 'dev';
-  var BRAND = 'Scribe';
+  var BRAND = 'Gleaner';
 
   // ------------------------------------------------------------------ helpers
 
@@ -44,7 +45,14 @@
     stop: 'M6 6h12v12H6z',
     play: 'M8 5v14l11-7z',
     refresh: 'M17.65 6.35A7.96 7.96 0 0012 4a8 8 0 108 8h-2a6 6 0 11-1.76-4.24L13 11h7V4z',
-    trash: 'M6 19a2 2 0 002 2h8a2 2 0 002-2V7H6zM19 4h-3.5l-1-1h-5l-1 1H5v2h14z'
+    trash: 'M6 19a2 2 0 002 2h8a2 2 0 002-2V7H6zM19 4h-3.5l-1-1h-5l-1 1H5v2h14z',
+    movie: 'M18 4l2 4h-3l-2-4h-2l2 4h-3l-2-4H8l2 4H7L5 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V4h-4z',
+    scissors: 'M9.64 7.64c.23-.5.36-1.05.36-1.64 0-2.21-1.79-4-4-4S2 3.79 2 6s1.79 4 4 4c.59 0 1.14-.13 1.64-.36L10 12l-2.36 2.36C7.14 14.13 6.59 14 6 14c-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4c0-.59-.13-1.14-.36-1.64L12 14l7 7h3v-1L9.64 7.64zM6 8c-1.1 0-2-.89-2-2s.9-2 2-2 2 .89 2 2-.9 2-2 2zm0 12c-1.1 0-2-.89-2-2s.9-2 2-2 2 .89 2 2-.9 2-2 2zm6-7.5c-.28 0-.5-.22-.5-.5s.22-.5.5-.5.5.22.5.5-.22.5-.5.5zM19 3l-6 6 2 2 7-7V3z',
+    prev: 'M15.41 7.41L14 6l-6 6 6 6 1.41-1.41L10.83 12z',
+    next: 'M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z',
+    first: 'M18.41 16.59L13.82 12l4.59-4.59L17 6l-6 6 6 6zM6 6h2v12H6z',
+    last: 'M5.59 7.41L10.18 12l-4.59 4.59L7 18l6-6-6-6zM16 6h2v12h-2z',
+    plus: 'M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z'
   };
 
   function icon(name, size) {
@@ -112,7 +120,7 @@
     return e;
   }
 
-  // Scribe's own messages are plain sentences. Anything else (a network
+  // Gleaner's own messages are plain sentences. Anything else (a network
   // TypeError, a JSON SyntaxError) becomes one.
   function plainError(e) {
     var msg = e && e.name === 'Error' && e.message ? e.message : "YouTube didn't answer.";
@@ -121,7 +129,7 @@
 
   // ------------------------------------------------------------- transcript
   //
-  // YouTube guards its caption files with a proof-of-origin token, so Scribe
+  // YouTube guards its caption files with a proof-of-origin token, so Gleaner
   // never fetches them itself. It listens to the player's own requests
   // instead and, when needed, flicks the CC button to make the player ask.
   // Every caption file is filed under the video id in its URL, so a preview
@@ -232,17 +240,36 @@
 
   function ccButton() { return document.querySelector('#movie_player .ytp-subtitles-button'); }
 
-  // Scribe turns captions on only to make the player ask for them, and YouTube
-  // remembers that switch for every later video. So the capture that turned
-  // them on turns them back off: on whatever video is showing by then (CC is
-  // one setting for the whole player), and right away when the viewer leaves
-  // mid-capture, while the old video is still loaded.
-  var ccOwner = null;
+  // Gleaner switches captions on (or off and on again) only to make the player
+  // ask for them, and YouTube remembers the switch for every later video. So
+  // the capture that touched them puts them back the way the viewer had them
+  // (ccWant): on whatever video is showing by then (CC is one setting for the
+  // whole player), and right away when the viewer leaves mid-capture. It
+  // checks again in case a click didn't land; before 15 Oct 2026 a capture
+  // that failed could leave the viewer's captions off.
+  var ccOwner = null, ccWant = false;
+  function ccOn() { var b = ccButton(); return !!(b && b.getAttribute('aria-pressed') === 'true'); }
   function restoreCC(owner) {
     if (!ccOwner || (owner && owner !== ccOwner)) return;
     ccOwner = null;
-    var b = ccButton();
-    if (b && b.getAttribute('aria-pressed') === 'true') b.click();
+    var want = ccWant, tries = 0;
+    (function fix() {
+      var b = ccButton();
+      if (!b || ccOwner) return; // gone, or another capture has taken over
+      if (ccOn() === want) return;
+      b.click();
+      if (++tries < 3) setTimeout(fix, 700);
+    })();
+  }
+  // Resolves once the CC switch shows on (or off), or after ms.
+  function ccSettled(on, ms) {
+    var until = Date.now() + ms;
+    return new Promise(function (resolve) {
+      (function check() {
+        if (ccOn() === on || Date.now() > until) resolve(ccOn() === on);
+        else setTimeout(check, 50);
+      })();
+    });
   }
 
   function captionTracks(videoId) {
@@ -258,7 +285,7 @@
     if (transcriptJobs[videoId]) return transcriptJobs[videoId];
 
     var job = new Promise(function (resolve, reject) {
-      var settled = false, timer = 0, turnedOn = false, me = {};
+      var settled = false, timer = 0, touched = false, me = {};
 
       function onSegs(segs) { finish(null, segs); }
       function finish(err, segs) {
@@ -269,7 +296,7 @@
         if (list) { var i = list.indexOf(onSegs); if (i !== -1) list.splice(i, 1); }
         delete transcriptJobs[videoId];
         // Put captions back the way the viewer had them (see restoreCC).
-        if (turnedOn) setTimeout(function () { restoreCC(me); }, 300);
+        if (touched) setTimeout(function () { restoreCC(me); }, 300);
         if (err) reject(err); else resolve(segs);
       }
       (transcriptWaiters[videoId] = transcriptWaiters[videoId] || []).push(onSegs);
@@ -317,22 +344,19 @@
           if (!slow && now > slowAt) { slow = true; if (onStatus) onStatus('slow'); }
           if (now > deadline) finish(failure("YouTube didn't send the captions. Try again.", 'timeout'));
         }, 500);
-        var btn = ccButton();
-        if (btn.getAttribute('aria-pressed') === 'true') {
-          // Captions already on: switch off and back on so the player asks again.
-          // If they're on because an earlier capture switched them on (and its
-          // switch-off is still pending), this capture owns that switch-off now.
-          if (ccOwner) { turnedOn = true; ccOwner = me; }
-          btn.click();
-          await sleep(450);
-          var again = ccButton();
-          // Not if Scribe's switch-off already ran meanwhile (captions came, or
-          // the viewer left): those captions were never the viewer's.
-          if (again && again.getAttribute('aria-pressed') !== 'true' && !(turnedOn && ccOwner !== me)) again.click();
-        } else {
-          btn.click();
-          turnedOn = true;
-          ccOwner = me;
+        // The viewer's own setting: what the switch shows now, unless an earlier
+        // capture's put-back is still pending (then that one knew it). From
+        // here this capture puts captions back to it, however it ends.
+        var wasOn = ccOn();
+        ccWant = ccOwner ? ccWant : wasOn;
+        ccOwner = me;
+        touched = true;
+        ccButton().click();
+        if (wasOn) {
+          // Captions were on: off, then on again once the switch shows off, so
+          // the player asks for them again.
+          await ccSettled(false, 3000);
+          if (ccOwner === me && !settled && !ccOn()) ccButton().click();
         }
       })();
     });
@@ -503,7 +527,7 @@
     });
     // Once YouTube has shown the comments under the video, it keeps them in
     // this section, and the token left here points past the top ones
-    // (checked live, 22 Sep 2026). Scribe asks for a fresh copy then.
+    // (checked live, 22 Sep 2026). Gleaner asks for a fresh copy then.
     if (threads) return { state: 'stale' };
     if (token) return { state: 'ok', token: token };
     // 'Comments are turned off' shows as a message; anything else is unknown.
@@ -792,15 +816,17 @@
   // hour to go. gained is what this run has read so far; left is the rows
   // still to come, or -1 when the total isn't known.
   function exportPlan(started, gained, left) {
-    var secs = (Date.now() - started) / 1000, eta = '', t = 0;
-    if (left >= 0 && secs >= 10 && gained >= 200) {
-      t = left / (gained / secs);
-      var mins = Math.round(t / 60);
-      if (t < 45) eta = 'Under a minute left';
-      else if (mins < 60) eta = 'About ' + Math.max(1, mins) + ' min left';
-      else eta = 'About ' + Math.floor(mins / 60) + ' h' + (mins % 60 ? ' ' + (mins % 60) + ' min' : '') + ' left';
-    }
+    var secs = (Date.now() - started) / 1000, t = -1;
+    if (left >= 0 && secs >= 10 && gained >= 200) t = left / (gained / secs);
+    var eta = t < 0 ? '' : t < 45 ? 'Under a minute left' : 'About ' + timeLeft(t) + ' left';
     return { eta: eta, long: t > 1800 };
+  }
+  // "under a minute", "25 min", "12 h 24 min".
+  function timeLeft(t) {
+    var mins = Math.round(t / 60);
+    if (t < 45) return 'under a minute';
+    if (mins < 60) return Math.max(1, mins) + ' min';
+    return Math.floor(mins / 60) + ' h' + (mins % 60 ? ' ' + (mins % 60) + ' min' : '');
   }
 
   // An export of every comment and reply on a video. run() reads until the
@@ -817,8 +843,12 @@
   // reading stands, so another visit can save it again, carry on from the
   // note (restore), or update() it with just the comments posted since.
   // Without store, the file stays in this page. save() writes the file.
-  function exportComments(videoId, onProgress, store, restore) {
+  // gentle reads more slowly (an export that started by itself).
+  function exportComments(videoId, onProgress, store, restore, gentle) {
     var total = 0, count = 0, comments = 0, replies = 0, rows = 0;
+    // Rows per second, measured during a run and kept in the note, so a
+    // paused export can say how long it needs to finish.
+    var pace = (restore && restore.pace) || 0, runStart = 0, runCount = 0;
     // There's no limit on how many comments an export reads, so nothing big
     // stays in the page's memory: each comment becomes its CSV line as soon as
     // it arrives (YouTube's bulky payload is dropped), and each thread moves
@@ -949,6 +979,8 @@
     // token is in the file or in the threads still loading, which are kept as
     // their top comment and the links to their first replies.
     function note() {
+      var secs = runStart ? (Date.now() - runStart) / 1000 : 0;
+      if (secs > 20 && count - runCount > 200) pace = (count - runCount) / secs;
       var unflushed = [], tops = children[''];
       for (var i = flushAt; i < tops.length; i++) {
         if (tops[i] == null) continue;
@@ -958,7 +990,7 @@
         v: 1, videoId: videoId, seq: ++seq, startedAt: startedAt, updatedAt: Date.now(),
         title: readDetails(videoId).title || '', total: total, rows: rows,
         fileComments: fileComments, fileReplies: fileReplies,
-        begun: begun, finished: finished, cut: cut, token: token, nextOrder: nextOrder, headBatches: headBatches,
+        begun: begun, finished: finished, cut: cut, token: token, nextOrder: nextOrder, headBatches: headBatches, pace: pace,
         unflushed: unflushed, firstIds: firstIds.slice(), lastIds: lastIds.slice(), pinned: Object.keys(pinnedIds)
       };
     }
@@ -1083,13 +1115,15 @@
     function startWorkers() {
       pagesDone = false;
       var workers = [];
-      for (var w = 0; w < REPLY_WORKERS; w++) workers.push(replyWorker());
+      for (var w = 0; w < (gentle ? GENTLE_WORKERS : REPLY_WORKERS); w++) workers.push(replyWorker());
       return workers;
     }
 
     async function read() {
       stopped = false;
       if (!begun) await begin();
+      runStart = Date.now();
+      runCount = count;
       var why = '';
       if (!finished) {
         var timer = store ? setInterval(checkpoint, CHECKPOINT_MS) : null;
@@ -1118,6 +1152,7 @@
             if (got.added) stale = 0; else if (++stale >= 5) { why = 'loop'; token = null; cut = true; }
             flush(false);
             tick();
+            if (gentle && token) await sleep(GENTLE_GAP_MS);
           }
         } finally {
           pagesDone = true;
@@ -1242,7 +1277,8 @@
       update: once(readUpdate),
       stop: function () { stopped = true; wake(); },
       save: save,
-      finished: function () { return finished; }
+      finished: function () { return finished; },
+      setGentle: function (g) { gentle = !!g; } // takes effect from the next run
     };
   }
 
@@ -1251,6 +1287,10 @@
   var MAIN_ORDER = 1e9, BATCH_SPAN = 1e5;
   var FIRST_IDS = 200, LAST_IDS = 200;
   var CHECKPOINT_MS = 30000; // a long run saves its place at least this often
+  // An export that starts by itself reads with fewer helpers and a pause
+  // between pages, so a day of browsing doesn't look like a scraper to YouTube.
+  var GENTLE_WORKERS = 2, GENTLE_GAP_MS = 400;
+  var AUTO_UPDATE_AFTER = 5 * 60000; // a finished export checks for new comments at most this often
 
   var EXPORT_COLUMNS = ['video_id', 'comment_id', 'parent_id', 'thread_id', 'reply_level', 'author', 'author_channel_id',
     'text', 'likes', 'replies', 'published', 'edited', 'pinned', 'hearted', 'by_creator'];
@@ -1410,6 +1450,35 @@
     '#scribe-panel .sc-note.sc-bad{color:var(--sc-bad)}',
     '#scribe-panel [hidden]{display:none!important}',
     '#scribe-panel .sc-pop{animation:sc-pop .25s var(--sc-ease)}',
+    '#scribe-panel .sc-auto{all:unset;margin-left:auto;font:400 12px/16px "Roboto","Arial",sans-serif;color:var(--sc-text2);cursor:pointer;padding:2px 6px;border-radius:8px}',
+    '#scribe-panel .sc-auto:hover{background:color-mix(in srgb,var(--sc-text) 10%,transparent)}',
+    '#scribe-panel .sc-auto:focus-visible{outline:2px solid var(--sc-accent);outline-offset:2px}',
+    '#scribe-panel .sc-btn[aria-pressed="true"]{background:color-mix(in srgb,var(--sc-text) 22%,transparent)}',
+    '#scribe-panel .sc-cut{margin-top:12px;padding-top:12px;border-top:1px solid var(--sc-line)}',
+    '#scribe-panel .sc-cut>.sc-row+.sc-row{margin-top:8px}',
+    '#scribe-panel .sc-mini{gap:0;padding:0 8px}',
+    '#scribe-panel .sc-time{flex:0 0 112px;padding:0 10px;text-align:center;font-variant-numeric:tabular-nums}',
+    '#scribe-panel .sc-partname{font:500 12px/16px "Roboto","Arial",sans-serif;color:var(--sc-text2);margin:0 2px}',
+    '#scribe-panel .sc-cliplen{flex:1 1 auto;margin:0 4px;font:400 12px/16px "Roboto","Arial",sans-serif;color:var(--sc-text2);font-variant-numeric:tabular-nums}',
+    '#scribe-panel .sc-clipresult{margin-top:10px;align-items:flex-end}',
+    '#scribe-panel .sc-clipvid{display:block;width:320px;max-width:100%;border-radius:8px;background:#000}',
+    // The bar: the whole video, a part per pair of needles, the playhead.
+    '#scribe-panel .sc-bar{position:relative;height:48px;margin:8px 7px 14px;border-radius:6px;background:var(--sc-base);cursor:pointer;user-select:none;touch-action:none}',
+    '#scribe-panel .sc-strip{position:absolute;inset:0;display:flex;overflow:hidden;border-radius:6px;opacity:.5}',
+    '#scribe-panel .sc-tile{flex:none;height:100%;background-repeat:no-repeat}',
+    '#scribe-panel .sc-parts{position:absolute;inset:0}',
+    '#scribe-panel .sc-part{position:absolute;top:0;bottom:0;border-radius:3px;background:color-mix(in srgb,var(--sc-accent) 22%,transparent);box-shadow:inset 0 0 0 2px color-mix(in srgb,var(--sc-accent) 55%,transparent)}',
+    '#scribe-panel .sc-part.sc-sel{background:color-mix(in srgb,var(--sc-accent) 32%,transparent);box-shadow:inset 0 0 0 2px var(--sc-accent)}',
+    '#scribe-panel .sc-needle{position:absolute;top:-7px;bottom:-7px;width:16px;margin-left:-8px;cursor:ew-resize;outline:none;z-index:1}',
+    '#scribe-panel .sc-needle[data-edge="from"]{left:0}',
+    '#scribe-panel .sc-needle[data-edge="to"]{left:100%}',
+    '#scribe-panel .sc-needle::before{content:"";position:absolute;left:7px;top:6px;bottom:0;width:2px;background:var(--sc-accent)}',
+    '#scribe-panel .sc-needle::after{content:"";position:absolute;left:2px;top:0;width:12px;height:12px;border-radius:50%;background:var(--sc-accent)}',
+    '#scribe-panel .sc-needle:focus-visible::after{box-shadow:0 0 0 2px var(--sc-text)}',
+    '#scribe-panel .sc-peek{position:fixed;z-index:2300;padding:4px;border-radius:8px;background:var(--sc-base);box-shadow:0 4px 18px rgba(0,0,0,.5);pointer-events:none;text-align:center}',
+    '#scribe-panel .sc-peek-img{border-radius:4px;background-color:#000;background-repeat:no-repeat}',
+    '#scribe-panel .sc-peek-time{margin-top:3px;font:500 12px/16px "Roboto","Arial",sans-serif;color:var(--sc-text);font-variant-numeric:tabular-nums}',
+    '#scribe-panel .sc-playhead{position:absolute;top:-3px;bottom:-3px;width:2px;margin-left:-1px;border-radius:1px;background:var(--sc-text);pointer-events:none;z-index:2}',
     '@keyframes sc-spin{to{transform:rotate(360deg)}}',
     '@keyframes sc-pop{from{transform:scale(.5);opacity:0}to{transform:scale(1);opacity:1}}',
     '@media (prefers-reduced-motion:reduce){#scribe-panel,#scribe-panel .sc-card,#scribe-pill,#scribe-pill svg{transition:none}#scribe-panel .sc-pop{animation:none}}'
@@ -1436,6 +1505,9 @@
       exportState: 'idle', exportJob: null, exportCount: 0, exportTotal: 0, exportTarget: 0,
       exportStopping: false, exportWritten: 0, exportRunStart: 0, exportBase: 0,
       exportMode: 'run', exportSaved: null, storeOk: null, overArmed: false,
+      savedAsking: false, savedTries: 0, autoTried: false, exportAuto: false,
+      clipOpen: false, clipParts: [], clipSel: 0, clipSnap: null, clipDrag: null, clipJob: null, clipStatus: '',
+      clipNote: '', clipBad: false, clipResult: null,
       note: '', noteBad: false, lastCopyChars: 0
     };
   }
@@ -1520,20 +1592,25 @@
     stop.node.hidden = true;
     var cont = makeButton('sc-tonal', 'play', 'Continue', 'Carry on from where it stopped', continueExport);
     cont.node.hidden = true;
+    var auto = el('button', { class: 'sc-auto', type: 'button', onclick: toggleAuto });
     var upd = makeButton('sc-tonal', 'refresh', 'Update', 'Add the comments posted since, at the top', updateExport);
     upd.node.hidden = true;
     var over = makeButton('sc-tonal', 'trash', 'Start over', 'Delete the saved export of this video', startOver);
     over.node.hidden = true;
     var send = makeButton('sc-tonal', 'send', 'Send to Claude', "Open Claude in Chrome's side panel and send it everything", doSend);
+    var clip = CLIPS ? makeButton('sc-tonal', 'movie', 'Clip', 'Cut a part of this video, frame by frame, into a video file', toggleClip) : null;
+    var clipRow = CLIPS ? buildClipRow() : null;
     var note = el('div', { class: 'sc-note', role: 'status', 'aria-live': 'polite' });
 
     var card = el('div', { class: 'sc-card' }, [
       el('div', { class: 'sc-head' }, [
         el('span', { class: 'sc-name', text: BRAND }),
-        el('div', { class: 'sc-steps' }, [stepT.node, stepD.node, stepC.node])
+        el('div', { class: 'sc-steps' }, [stepT.node, stepD.node, stepC.node]),
+        auto
       ]),
-      el('div', { class: 'sc-row' }, [ask, copy.node, exp.node, stop.node, cont.node, upd.node, over.node, send && send.node]),
-      note
+      el('div', { class: 'sc-row' }, [ask, copy.node, exp.node, stop.node, cont.node, upd.node, over.node, send && send.node, clip && clip.node]),
+      note,
+      clipRow && clipRow.node
     ]);
     var panel = el('div', { id: 'scribe-panel', role: 'region', 'aria-label': BRAND }, [
       el('div', { class: 'sc-clip' }, [card])
@@ -1544,8 +1621,8 @@
 
     ui.panel = panel;
     ui.refs = {
-      stepT: stepT, stepD: stepD, stepC: stepC, ask: ask, copy: copy, exp: exp, stop: stop, cont: cont, upd: upd, over: over,
-      send: send, note: note
+      stepT: stepT, stepD: stepD, stepC: stepC, ask: ask, copy: copy, exp: exp, stop: stop, cont: cont, upd: upd, over: over, auto: auto,
+      send: send, clip: clip, clipRow: clipRow, note: note
     };
   }
 
@@ -1623,7 +1700,7 @@
     var ex = ui.exportState === 'paused' ? 'ready' : ui.exportState, n = ui.exportCount;
     setButton(r.exp, ex, {
       idle: 'Export comments',
-      busy: 'Exporting… ' + fmtNumber(n) + (ui.exportTarget ? ' of ' + fmtNumber(ui.exportTarget) : ''),
+      busy: ui.exportMode === 'update' ? 'Checking for new comments…' : 'Exporting… ' + fmtNumber(n) + (ui.exportTarget ? ' of ' + fmtNumber(ui.exportTarget) : ''),
       ready: 'Save spreadsheet',
       done: 'Saved',
       fail: 'Export failed'
@@ -1634,12 +1711,17 @@
     r.stop.node.hidden = ex !== 'busy';
     setButton(r.stop, ui.exportStopping ? 'busy' : 'idle', ui.exportStopping ? 'Stopping…' : 'Stop');
     r.cont.node.hidden = ui.exportState !== 'paused';
+    r.auto.textContent = autoOn() ? 'Saves comments by itself: on' : 'Saves comments by itself: off';
+    r.auto.title = autoOn()
+      ? 'Comments start saving as soon as a video opens, and saved ones pick up new comments. Click to turn off.'
+      : 'Click to save comments as soon as a video opens, and keep saved ones up to date.';
     r.upd.node.hidden = !(ui.exportState === 'ready' && ui.storeOk && ui.exportSaved && ui.exportSaved.finished);
     r.over.node.hidden = ui.exportState !== 'ready' && ui.exportState !== 'paused';
     setButton(r.over, 'idle', ui.overArmed ? 'Sure? Click again' : 'Start over');
 
     r.note.textContent = ui.note;
     r.note.classList.toggle('sc-bad', !!ui.noteBad);
+    renderClip(r);
   }
 
   function setNote(message, bad) {
@@ -1807,6 +1889,1127 @@
     });
   }
 
+  // ------------------------------------------------------------------ clips
+  //
+  // The clip editor: the whole video as a bar of YouTube's own preview
+  // thumbnails, two needles for each part to keep, and + for another part.
+  // Make clip joins the parts in time order, with no gap, into one MP4 (H.264
+  // + AAC) cut at exact frames: a part starts on the frame on screen at its
+  // start needle (the browser reports each frame's own time) and ends on the
+  // frame on screen at its end needle, and the sound is cut at the same
+  // moments, with a 4 ms fade where parts meet. The whole video as one part is
+  // copied as YouTube sent it instead: no re-encoding, full quality, about as
+  // fast as YouTube sends it.
+  //
+  // The media: media-keeper.js keeps a copy of what the player loads (as
+  // Blobs, which Chrome keeps on disk when they get big). Gleaner moves the
+  // player (paused) through a part so it loads at download speed, and cuts it
+  // in windows as they arrive, so the page's memory stays flat however long
+  // the clip. The file is written to disk as it's made (the page's private
+  // storage), so its size doesn't matter either; Save copies it to Downloads.
+  // The cutter (lib/mediabunny.js) goes into the page only when a clip is
+  // made. Protected (DRM) video is refused.
+  var CLIPS = true; // tools/build-store.js turns this off: the Chrome Web Store bans YouTube downloads
+  var CLIP_WINDOW = 60; // seconds loaded and cut at a time
+  var AUDIO_BITRATE = 192e3;
+  var CLIP_DIR = 'gleaner-clips';
+
+  function mainVideo() {
+    return document.querySelector('#movie_player video.html5-main-video') || document.querySelector('#movie_player video');
+  }
+  function videoLength() { var v = mainVideo(); return v && isFinite(v.duration) && v.duration > 0 ? v.duration : 0; }
+  // A moment inside the last frame: as far as an end needle goes.
+  function lastMoment() { return Math.max(0, videoLength() - 0.001); }
+
+  // What the player is showing, from its own stats: { width, height, fps }.
+  function playerFormat() {
+    var out = { width: 0, height: 0, fps: 30 };
+    try {
+      var m = /(\d+)x(\d+)@(\d+(?:\.\d+)?)/.exec(document.getElementById('movie_player').getStatsForNerds().resolution || '');
+      if (m) { out.width = +m[1]; out.height = +m[2]; if (+m[3] > 0) out.fps = +m[3]; }
+    } catch (e) {}
+    return out;
+  }
+  // YouTube's own name for the quality showing ("1080p60"), which goes by the
+  // usual heights even for wide films (2048×872 is "1080p").
+  function qualityLabel(f) {
+    try {
+      var label = document.getElementById('movie_player').getPlaybackQualityLabel();
+      if (label && /^\d+p/.test(label)) return label;
+    } catch (e) {}
+    return f.height ? f.height + 'p' + (f.fps > 30 ? Math.round(f.fps) : '') : '';
+  }
+
+  function clipClock(t) {
+    var ms = Math.round(Math.max(0, t || 0) * 1000);
+    function pad(n, w) { n = String(n); while (n.length < w) n = '0' + n; return n; }
+    var h = Math.floor(ms / 3600000), m = Math.floor(ms / 60000) % 60, s = Math.floor(ms / 1000) % 60;
+    return (h ? h + ':' + pad(m, 2) : m) + ':' + pad(s, 2) + '.' + pad(ms % 1000, 3);
+  }
+  function parseClipClock(value) {
+    var parts = String(value || '').trim().split(':'), t = 0;
+    if (!parts[0] || parts.length > 3) return null;
+    for (var i = 0; i < parts.length; i++) {
+      if (!/^\d+(\.\d*)?$/.test(parts[i])) return null;
+      t = t * 60 + parseFloat(parts[i]);
+    }
+    return t;
+  }
+  function lengthWords(sec) {
+    sec = Math.max(1, Math.round(sec));
+    var h = Math.floor(sec / 3600), m = Math.floor(sec % 3600 / 60), s = sec % 60;
+    return h ? h + ' h ' + m + ' min' : m ? m + ' min' + (s ? ' ' + s + ' s' : '') : s + ' s';
+  }
+  function secsWords(sec) { return sec < 60 ? (Math.round(sec * 1000) / 1000) + ' s' : lengthWords(sec); }
+  function sizeWords(bytes) { return bytes >= 1073741824 ? (bytes / 1073741824).toFixed(1) + ' GB' : Math.max(0.1, bytes / 1048576).toFixed(1) + ' MB'; }
+
+  function selectedPart(st) { return st.clipParts[st.clipSel] || st.clipParts[0] || null; }
+  function partsInOrder(st) {
+    return st.clipParts.map(function (p) { return { from: p.from, to: p.to }; }).sort(function (a, b) { return a.from - b.from; });
+  }
+  function isWhole(st, fps) {
+    var d = videoLength(), p = st.clipParts[0];
+    return !!d && st.clipParts.length === 1 && p.from <= 0.5 / fps && p.to >= d - 1.5 / fps;
+  }
+
+  // The time of the frame on screen. The browser says which frame it showed
+  // (requestVideoFrameCallback), which is exact; while playing, or before it
+  // has said, the player's clock stands in.
+  var shown = { video: null, time: -1 }, frameWatch = null, timed = new WeakSet();
+  function watchFrames() {
+    var v = mainVideo();
+    if (!v || !v.requestVideoFrameCallback || (frameWatch && frameWatch.video === v)) return;
+    frameWatch = { video: v };
+    if (!timed.has(v)) {
+      timed.add(v);
+      v.addEventListener('timeupdate', movePlayhead);
+      v.addEventListener('seeking', movePlayhead);
+    }
+    v.requestVideoFrameCallback(function (now, meta) {
+      frameWatch = null;
+      shown = { video: v, time: meta.mediaTime };
+      var st = ui;
+      if (!st || !st.clipOpen) return;
+      var snap = st.clipSnap, p = snap && st.clipParts[snap.part];
+      if (p && !st.clipDrag) {
+        // A needle was placed: settle it on that frame's own time.
+        p[snap.edge] = meta.mediaTime;
+        if (p.to < p.from) { var t = p.to; p.to = p.from; p.from = t; }
+        st.clipSnap = null;
+        render();
+      } else {
+        movePlayhead();
+      }
+      watchFrames();
+    });
+  }
+  function frameNow() {
+    var v = mainVideo();
+    if (!v) return null;
+    if (shown.video === v && v.paused && Math.abs(v.currentTime - shown.time) < 0.25) return shown.time;
+    return v.currentTime;
+  }
+  function movePlayhead() {
+    var c = ui && ui.clipOpen && ui.refs && ui.refs.clipRow, v = mainVideo(), d = videoLength();
+    if (!c || !v || !d) return;
+    c.playhead.style.left = Math.min(100, v.currentTime / d * 100) + '%';
+  }
+  function showMoment(t, pause) {
+    var v = mainVideo();
+    if (!v) return;
+    if (pause && !v.paused) v.pause();
+    v.currentTime = Math.max(0, Math.min(lastMoment() || t, t));
+  }
+
+  var engineLoading = null;
+  function clipEngine() {
+    if (window.Mediabunny) return Promise.resolve(window.Mediabunny);
+    if (!engineLoading) {
+      engineLoading = new Promise(function (resolve, reject) {
+        var timer = setTimeout(function () { finish({ ok: false, error: 'no answer' }); }, 20000);
+        function finish(res) {
+          clearTimeout(timer);
+          window.removeEventListener('scribe:clip-engine-result', onResult);
+          engineLoading = null;
+          if (res && res.ok && window.Mediabunny) resolve(window.Mediabunny);
+          else reject(failure(BRAND + " couldn't load its clip cutter" + (res && res.error ? ' (' + res.error + ')' : '') + '. Refresh the page and try again.'));
+        }
+        function onResult(e) { var res = null; try { res = JSON.parse(e.detail); } catch (err) {} finish(res); }
+        window.addEventListener('scribe:clip-engine-result', onResult);
+        window.dispatchEvent(new CustomEvent('scribe:clip-engine'));
+      });
+    }
+    return engineLoading;
+  }
+
+  function stopIfAsked(job) {
+    if (job.cancelled) throw failure('Stopped.', 'stopped');
+    if (currentVideoId() !== job.videoId) throw failure('moved', 'moved');
+  }
+
+  // Moves the player for a clip, and puts it back where it was after.
+  function playerSession(job) {
+    var v = mainVideo(), player = document.getElementById('movie_player');
+    var wasPaused = v.paused, wasAt = v.currentTime, moved = false;
+    return {
+      video: v,
+      seek: function (t) {
+        moved = true;
+        if (!v.paused) v.pause();
+        if (player && player.seekTo) player.seekTo(t, true); else v.currentTime = t;
+      },
+      restore: function () {
+        if (!moved || currentVideoId() !== job.videoId) return;
+        moved = false;
+        if (player && player.seekTo) player.seekTo(wasAt, true); else v.currentTime = wasAt;
+        if (wasPaused) v.pause(); else v.play().catch(function () {});
+      }
+    };
+  }
+
+  // Makes the player load [start, end) until the media keeper holds all of
+  // it: the player is moved to the first moment that's missing whenever its
+  // own reading ahead is about done there, or loading stalls.
+  async function loadRange(session, start, end, onProgress, job) {
+    var media = window.__gleanerMedia, v = session.video, d = videoLength();
+    if (d) end = Math.min(end, d - 0.05); // the streams can stop a hair before the stated length
+    start = Math.min(start, end);
+    var sound = media.has('audio', v);
+    var best = -1, gainAt = Date.now(), seekAt = 0, losses = 0;
+    for (;;) {
+      stopIfAsked(job);
+      var now = Date.now();
+      if (isAdPlaying()) { gainAt = now; best = -1; seekAt = 0; await sleep(500); continue; }
+      var pv = media.pick('video', start, end, v), pa = sound ? media.pick('audio', start, end, v) : {};
+      if (!pv.missing && !pa.missing) return { video: pv, audio: sound ? pa : null };
+      var front = Math.min(pv.missing ? pv.missing[0][0] : end, pa.missing ? pa.missing[0][0] : end);
+      if (onProgress) onProgress(Math.max(0, Math.min(1, (front - start) / Math.max(0.001, end - start))));
+      if (front > best + 0.01) {
+        best = front;
+        gainAt = now;
+      } else if (front < best - 0.5) {
+        // Pieces it had were let go (YouTube restarted its player, say).
+        if (++losses > 3) throw failure('YouTube kept dropping that part. Try again.');
+        best = front;
+        gainAt = now;
+      }
+      if (now - gainAt > 20000) throw failure("YouTube didn't send that part of the video. Refresh the page and try again.");
+      if (!seekAt || (front - v.currentTime > 15 && now - seekAt > 500) || (now - gainAt > 1000 && now - seekAt > 1000)) {
+        session.seek(front);
+        seekAt = now;
+      }
+      await sleep(150);
+    }
+  }
+
+  // The finished file is written to the page's private storage (OPFS) as it's
+  // made; Save copies it to Downloads.
+  async function clipFile(ext) {
+    var root = await navigator.storage.getDirectory();
+    var dir = await root.getDirectoryHandle(CLIP_DIR, { create: true });
+    // Clips left from earlier visits (a day old or more) go.
+    try {
+      for await (var entry of dir.values()) {
+        if (entry.kind !== 'file') continue;
+        var f = await entry.getFile();
+        if (Date.now() - f.lastModified > 864e5) await dir.removeEntry(entry.name);
+      }
+    } catch (e) {}
+    var name = 'clip-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8) + '.' + ext;
+    var handle = await dir.getFileHandle(name, { create: true });
+    return { name: name, handle: handle, writable: await handle.createWritable() };
+  }
+  function removeClipFile(name) {
+    if (!name) return;
+    navigator.storage.getDirectory()
+      .then(function (root) { return root.getDirectoryHandle(CLIP_DIR); })
+      .then(function (dir) { return dir.removeEntry(name); })
+      .catch(function () {});
+  }
+  async function roomFor(bytes) {
+    var e = null;
+    try { e = await navigator.storage.estimate(); } catch (err) {}
+    if (e && e.quota && e.quota - (e.usage || 0) < bytes * 1.1) {
+      throw failure("There isn't enough free disk space for this: it needs about " + sizeWords(bytes) + '.');
+    }
+  }
+
+  // The frames from a to b seconds into a sound packet, faded in or out over
+  // 4 ms where parts are joined (a hard cut can click).
+  function audioPiece(MB, s, a, b, fadeIn, fadeOut) {
+    var sr = s.sampleRate, ch = s.numberOfChannels;
+    var off = Math.max(0, Math.min(s.numberOfFrames, Math.round(a * sr)));
+    var n = Math.max(0, Math.min(s.numberOfFrames, Math.round(b * sr)) - off);
+    if (!n) return null;
+    var data = new Float32Array(n * ch), ramp = Math.min(n, Math.round(sr * 0.004));
+    for (var c = 0; c < ch; c++) {
+      var plane = data.subarray(c * n, (c + 1) * n);
+      s.copyTo(plane, { planeIndex: c, format: 'f32-planar', frameOffset: off, frameCount: n });
+      for (var i = 0; i < ramp; i++) {
+        var g = (i + 0.5) / ramp;
+        if (fadeIn) plane[i] *= g;
+        if (fadeOut) plane[n - 1 - i] *= g;
+      }
+    }
+    return new MB.AudioSample({ data: data, format: 'f32-planar', numberOfChannels: ch, sampleRate: sr, timestamp: s.timestamp + off / sr });
+  }
+
+  function openTrack(MB, inputs, blob, kind) {
+    var input = new MB.Input({ source: new MB.BlobSource(blob), formats: MB.ALL_FORMATS });
+    inputs.push(input);
+    return (kind === 'video' ? input.getPrimaryVideoTrack() : input.getPrimaryAudioTrack()).then(function (track) {
+      if (!track) throw failure('The ' + kind + " YouTube sent couldn't be read.");
+      return track;
+    });
+  }
+  function disposeAll(inputs) { inputs.splice(0).forEach(function (i) { try { i.dispose(); } catch (e) {} }); }
+
+  // Cuts the parts (in time order) at exact frames and encodes them, joined
+  // with no gap, into one MP4 (H.264 + AAC). For speed (measured 15 Oct 2026
+  // on 1080p60): frames are decoded on the CPU, because handing GPU-decoded
+  // frames to the encoder held everything to about 75 a second, and encoded
+  // on the GPU, ENCODERS windows at once, each by its own encoder (75 → about
+  // 586 a second). The windows are written in order; the sound goes through
+  // one encoder, in order, since separate sound encoders would leave clicks
+  // where they meet.
+  var ENCODERS = 3, ENCODE_WINDOW = 30; // windows at once; seconds each
+
+  // H.264 High profile at the level the size and frame rate need.
+  function avcCodec(w, h, fps) {
+    var mbs = Math.ceil(w / 16) * Math.ceil(h / 16), rate = mbs * fps;
+    var level = mbs <= 8704 && rate <= 522240 ? '2A' : mbs <= 36864 && rate <= 983040 ? '33' : mbs <= 36864 && rate <= 2073600 ? '34' : '3C';
+    return 'avc1.6400' + level;
+  }
+
+  async function encodeParts(MB, parts, fmt, session, progress, job) {
+    var media = window.__gleanerMedia, v = session.video, tol = 1e-4, fd = 1 / fmt.fps;
+    // The windows, in order: each part ENCODE_WINDOW seconds at a time.
+    var wins = [];
+    parts.forEach(function (p, k) {
+      for (var s = p.from; ; s += ENCODE_WINDOW) {
+        var last = s + ENCODE_WINDOW >= p.to + fd;
+        wins.push({ part: k, start: s, end: last ? p.to + fd : s + ENCODE_WINDOW, first: s === p.from, last: last, made: 0 });
+        if (last) break;
+      }
+    });
+    var total = 0;
+    wins.forEach(function (w) { total += w.end - w.start; });
+    var A = [], L = [], E = [];          // per part: first frame, last frame, end of the last frame
+    var file = null, out = null, vSrc = null, aSrc = null, firstConfig = null, encConfig = null, settingUp = null;
+    var W = 0, H = 0, frames = 0, base = 0, aAt = 0, written = 0, halted = null;
+    var running = 0, waiting = [];
+
+    function report() {
+      var made = 0;
+      wins.forEach(function (w) { made += w.made; });
+      progress('Cutting', made / total);
+    }
+    function check() {
+      stopIfAsked(job);
+      if (halted) throw halted;
+    }
+    async function open(runs, kind, inputs) {
+      var list = [];
+      for (var i = 0; i < runs.length; i++) {
+        list.push({ track: await openTrack(MB, inputs, runs[i].blob, kind), from: runs[i].from, to: runs[i].to, offset: runs[i].offset });
+      }
+      return list;
+    }
+    // The frame on screen at t: the last one that starts at or before it.
+    async function frameAt(runs, t) {
+      for (var i = runs.length - 1; i >= 0; i--) {
+        if (i && runs[i].from > t + tol) continue;
+        var sink = new MB.EncodedPacketSink(runs[i].track);
+        var p = await sink.getPacket(t - runs[i].offset + tol, { metadataOnly: true }) || await sink.getFirstPacket({ metadataOnly: true });
+        if (p) return { time: p.timestamp + runs[i].offset, duration: p.duration };
+      }
+      return null;
+    }
+    // The encoder settings, from the first window's frames: GPU if it can, else CPU.
+    async function setUp(track) {
+      W = track.displayWidth;
+      H = track.displayHeight;
+      // About 0.07 bits a pixel: close to the source by eye (8.7 Mbps at 1080p60).
+      var bitrate = Math.round(Math.min(40e6, Math.max(2e6, W * H * fmt.fps * 0.07)));
+      var tries = ['prefer-hardware', 'prefer-software'];
+      for (var i = 0; i < tries.length && !encConfig; i++) {
+        var cfg = { codec: avcCodec(W, H, fmt.fps), width: W, height: H, bitrate: bitrate, framerate: fmt.fps, hardwareAcceleration: tries[i], avc: { format: 'avc' } };
+        try { if ((await VideoEncoder.isConfigSupported(cfg)).supported) encConfig = cfg; } catch (e) {}
+      }
+      if (!encConfig) throw failure("This browser can't encode video here.");
+      await roomFor((bitrate + AUDIO_BITRATE) / 8 * total);
+    }
+
+    // One window's frames, encoded by its own encoder: the chunks wait in the
+    // window until it's its turn to be written.
+    async function encodeWindow(w) {
+      var inputs = [], enc = null, failed = null;
+      try {
+        var vRuns = await open(w.got.video.runs, 'video', inputs);
+        var p = parts[w.part];
+        if (w.first) {
+          var f = await frameAt(vRuns, p.from);
+          if (!f) throw failure("A part's first frame couldn't be found in what YouTube sent.");
+          A[w.part] = f.time;
+        }
+        if (w.last) {
+          var l = await frameAt(vRuns, p.to);
+          if (!l || (w.first && l.time < A[w.part] - tol)) throw failure("A part's last frame couldn't be found in what YouTube sent.");
+          L[w.part] = l.time;
+          E[w.part] = l.time + (l.duration || fd);
+        }
+        // Once, from whichever window gets there first.
+        await (settingUp || (settingUp = setUp(vRuns[0].track)));
+        check();
+        var lo = w.first ? A[w.part] : w.start, hi = w.last ? L[w.part] : null;
+        var chunks = [], config = null, n = 0, lastTs = -Infinity, keyEvery = Math.max(1, Math.round(fmt.fps * 2));
+        enc = new VideoEncoder({
+          output: function (chunk, meta) {
+            var data = new Uint8Array(chunk.byteLength);
+            chunk.copyTo(data);
+            chunks.push({ data: data, key: chunk.type === 'key', ts: chunk.timestamp / 1e6, dur: (chunk.duration || 0) / 1e6 });
+            if (meta && meta.decoderConfig && !config) config = meta.decoderConfig;
+          },
+          error: function (e) { failed = e; }
+        });
+        enc.configure(encConfig);
+        for (var i = 0; i < vRuns.length; i++) {
+          var r = vRuns[i];
+          if (r.to <= lo - tol) continue;
+          var sink = new MB.VideoSampleSink(r.track, { hardwareAcceleration: 'prefer-software' });
+          for await (var s of sink.samples(Math.max(0, lo - r.offset - 0.5), (w.last ? hi + tol : w.end) - r.offset + 0.001)) {
+            var ts = s.timestamp + r.offset;
+            if (ts >= lo - tol && ts > lastTs + tol && (w.last ? ts <= hi + tol : ts < w.end - tol)) {
+              var frame = s.toVideoFrame();
+              // The frame keeps its own time (in the player's timeline); the writer moves it into the clip's.
+              var timed = new VideoFrame(frame, { timestamp: Math.round(ts * 1e6), duration: Math.round((s.duration || fd) * 1e6) });
+              frame.close();
+              while (enc.encodeQueueSize >= 8) await new Promise(function (res) { enc.addEventListener('dequeue', res, { once: true }); });
+              enc.encode(timed, { keyFrame: n % keyEvery === 0 });
+              timed.close();
+              lastTs = ts;
+              n++;
+              w.made = Math.max(0, Math.min(w.end - w.start, ts - w.start));
+              report();
+            }
+            s.close();
+            if (failed) throw failed;
+            check();
+          }
+        }
+        await enc.flush();
+        if (failed) throw failed;
+        w.chunks = chunks;
+        w.config = config;
+        w.frames = n;
+        w.made = w.end - w.start;
+        report();
+      } finally {
+        if (enc && enc.state !== 'closed') { try { enc.close(); } catch (e) {} }
+        disposeAll(inputs);
+      }
+    }
+
+    function slot() {
+      if (running < ENCODERS) { running++; return Promise.resolve(); }
+      return new Promise(function (res) { waiting.push(res); });
+    }
+    function freeSlot() { var next = waiting.shift(); if (next) next(); else running--; }
+
+    // Loads the windows in order (one player), and starts each one's encoding.
+    async function loadAll() {
+      for (var i = 0; i < wins.length; i++) {
+        var w = wins[i];
+        // Not too far ahead of the writer: each waiting window holds its encoded video.
+        while (i - written > ENCODERS) { check(); await sleep(100); }
+        check();
+        w.got = await loadRange(session, Math.max(0, w.start - 1), w.end, function (p) {
+          if (!written && i === 0) progress('Loading', p * (w.end - w.start) / total);
+        }, job);
+        await slot();
+        w.done = encodeWindow(w).then(freeSlot, function (e) { freeSlot(); if (!halted) halted = e; throw e; });
+        w.done.catch(function () {});
+      }
+    }
+
+    // The sound for one window, through the one sound encoder, in order.
+    async function writeSound(w, inputs) {
+      if (!aSrc || !w.got.audio) return;
+      var aRuns = await open(w.got.audio.runs, 'audio', inputs);
+      var k = w.part, a0 = A[k], aTo = w.last ? E[k] : w.end;
+      for (var j = 0; j < aRuns.length; j++) {
+        var ar = aRuns[j];
+        if (ar.to <= aAt || ar.from >= aTo) continue;
+        var sink = new MB.AudioSampleSink(ar.track);
+        for await (var a of sink.samples(Math.max(0, aAt - ar.offset - 0.5), aTo - ar.offset)) {
+          var t0 = a.timestamp + ar.offset, t1 = t0 + a.duration;
+          var lo = Math.max(t0, aAt), hi = Math.min(t1, aTo);
+          if (hi - lo > 1e-6) {
+            var fadeIn = lo <= a0 + 1e-6, fadeOut = w.last && hi >= E[k] - 1e-6;
+            var piece = fadeIn || fadeOut || lo - t0 > 1e-6 || t1 - hi > 1e-6 ? audioPiece(MB, a, lo - t0, hi - t0, fadeIn, fadeOut) : a;
+            if (piece) {
+              piece.setTimestamp(base + piece.timestamp + ar.offset - a0);
+              await aSrc.add(piece);
+              if (piece !== a) piece.close();
+              aAt = hi;
+            }
+          }
+          a.close();
+          check();
+        }
+      }
+    }
+
+    var loading = loadAll();
+    loading.catch(function (e) { if (!halted) halted = e; });
+    try {
+      for (var i = 0; i < wins.length; i++) {
+        var w = wins[i], inputs = [];
+        while (!w.done) { check(); await sleep(50); }
+        await w.done;
+        check();
+        var k = w.part;
+        if (!out) {
+          if (!w.config) throw failure("The video encoder didn't start.");
+          firstConfig = w.config;
+          file = await clipFile('mp4');
+          out = new MB.Output({ format: new MB.Mp4OutputFormat(), target: new MB.StreamTarget(file.writable, { chunked: true }) });
+          vSrc = new MB.EncodedVideoPacketSource('avc');
+          out.addVideoTrack(vSrc);
+          if (w.got.audio) {
+            var aac = await MB.canEncodeAudio('aac', { numberOfChannels: 2, sampleRate: 48000, bitrate: AUDIO_BITRATE });
+            aSrc = new MB.AudioSampleSource({ codec: aac ? 'aac' : 'opus', bitrate: AUDIO_BITRATE });
+            out.addAudioTrack(aSrc);
+          }
+          await out.start();
+        } else if (w.config && !sameBytes(w.config.description, firstConfig.description)) {
+          // Each encoder describes its stream; one file can only take one description.
+          throw failure("The video encoders didn't agree. Try again.");
+        }
+        if (w.first) aAt = A[k];
+        for (var c = 0; c < w.chunks.length; c++) {
+          var ch = w.chunks[c];
+          var packet = new MB.EncodedPacket(ch.data, ch.key ? 'key' : 'delta', base + ch.ts - A[k], ch.dur);
+          await vSrc.add(packet, frames === 0 ? { decoderConfig: firstConfig } : undefined);
+          frames++;
+        }
+        w.chunks = null;
+        await writeSound(w, inputs);
+        disposeAll(inputs);
+        w.got = null;
+        if (w.last) base += E[k] - A[k];
+        written = i + 1;
+      }
+      await loading;
+      if (!frames) throw failure('No frames came out.');
+      vSrc.close();
+      if (aSrc) aSrc.close();
+      await out.finalize();
+    } catch (e) {
+      halted = halted || e;
+      if (out) { try { await out.cancel(); } catch (err) {} }
+      if (file) removeClipFile(file.name);
+      // Let the encoders still running see the stop before going on.
+      await Promise.all(wins.map(function (x) { return x.done ? x.done.catch(function () {}) : null; }));
+      throw e;
+    }
+    return { file: file, ext: 'mp4', frames: frames, seconds: base, width: W, height: H, first: A[0], last: L[parts.length - 1] };
+  }
+
+  function sameBytes(a, b) {
+    if (!a || !b) return !a && !b;
+    var x = ArrayBuffer.isView(a) ? new Uint8Array(a.buffer, a.byteOffset, a.byteLength) : new Uint8Array(a);
+    var y = ArrayBuffer.isView(b) ? new Uint8Array(b.buffer, b.byteOffset, b.byteLength) : new Uint8Array(b);
+    if (x.length !== y.length) return false;
+    for (var i = 0; i < x.length; i++) if (x[i] !== y[i]) return false;
+    return true;
+  }
+
+  // The whole video as YouTube sent it: its own video and sound, copied into
+  // one file without decoding. If YouTube switched quality partway, that can't
+  // be copied into one file, so it throws 'switched' and the caller re-encodes.
+  async function copyWhole(MB, fmt, session, progress, job) {
+    var media = window.__gleanerMedia, v = session.video, d = videoLength(), tol = 1e-3;
+    var kinds = media.has('audio', v) ? ['video', 'audio'] : ['video'];
+    var end = Math.max(0, d - 0.25), cursor = { video: 0, audio: 0 }, quality = {}, offset = {}, src = {}, first = {}, codecs = {};
+    var file = null, out = null, inputs = [], W = 0, H = 0, ext = 'webm';
+
+    // This quality's pieces from the cursor on, without a gap, up to `to`.
+    function pieces(kind, to) {
+      var list = media.list(kind, v), at = cursor[kind];
+      if (quality[kind] === undefined) {
+        // The sharpest quality (most bytes a second) among those holding the start.
+        var rate = {};
+        list.forEach(function (f) {
+          var r = rate[f.quality] || (rate[f.quality] = { bytes: 0, secs: 0 });
+          r.bytes += f.blob.size;
+          r.secs += Math.max(0.001, f.t1 - f.t0);
+        });
+        var holders = list.filter(function (f) { return f.t0 <= at + tol && f.t1 > at; }).sort(function (a, b) {
+          return rate[b.quality].bytes / rate[b.quality].secs - rate[a.quality].bytes / rate[a.quality].secs;
+        });
+        if (!holders.length) return [];
+        quality[kind] = holders[0].quality;
+        offset[kind] = holders[0].offset;
+      }
+      var mine = list.filter(function (f) { return f.quality === quality[kind] && f.offset === offset[kind] && f.t1 > at + tol; });
+      var take = [];
+      for (var i = 0; i < mine.length && at < to; i++) {
+        if (mine[i].t0 > at + 0.05) break;
+        take.push(mine[i]);
+        at = mine[i].t1;
+      }
+      if (at < to && list.some(function (f) { return (f.quality !== quality[kind] || f.offset !== offset[kind]) && f.t0 <= at + tol && f.t1 > at; })) {
+        throw failure('switched', 'switched');
+      }
+      return take;
+    }
+    async function begin(tracks, take) {
+      var vc = tracks.video.codec, ac = tracks.audio ? tracks.audio.codec : null;
+      W = tracks.video.displayWidth;
+      H = tracks.video.displayHeight;
+      var format = [new MB.WebMOutputFormat(), new MB.Mp4OutputFormat(), new MB.MkvOutputFormat()].filter(function (f) {
+        var ok = f.getSupportedCodecs();
+        return ok.indexOf(vc) >= 0 && (!ac || ok.indexOf(ac) >= 0);
+      })[0];
+      if (!format) throw failure('switched', 'switched');
+      ext = String(format.fileExtension || '.webm').replace(/^\./, '');
+      codecs = { video: vc, audio: ac };
+      // Room for the whole video, at the rate of what's kept so far.
+      var rate = 0;
+      Object.keys(take).forEach(function (kind) {
+        var bytes = 0, secs = 0;
+        take[kind].forEach(function (f) { bytes += f.blob.size; secs += f.t1 - f.t0; });
+        if (secs > 0) rate += bytes / secs;
+      });
+      await roomFor(rate * d);
+      file = await clipFile(ext);
+      out = new MB.Output({ format: format, target: new MB.StreamTarget(file.writable, { chunked: true }) });
+      src.video = new MB.EncodedVideoPacketSource(vc);
+      out.addVideoTrack(src.video);
+      if (ac) {
+        src.audio = new MB.EncodedAudioPacketSource(ac);
+        out.addAudioTrack(src.audio);
+      }
+      await out.start();
+    }
+    async function write(kind, track, take) {
+      var meta = first[kind] ? undefined : { decoderConfig: await track.getDecoderConfig() };
+      var off = take[0].offset;
+      for await (var p of new MB.EncodedPacketSink(track).packets()) {
+        await src[kind].add(off ? p.clone({ timestamp: p.timestamp + off }) : p, meta);
+        meta = undefined;
+        first[kind] = true;
+        stopIfAsked(job);
+      }
+      cursor[kind] = take[take.length - 1].t1;
+    }
+
+    try {
+      var idle = 0;
+      while (kinds.some(function (k) { return cursor[k] < end - tol; })) {
+        if (++idle > 5) throw failure("YouTube didn't send that part of the video. Refresh the page and try again.");
+        var wStart = Math.min.apply(null, kinds.map(function (k) { return cursor[k]; }));
+        var wEnd = Math.min(end, wStart + CLIP_WINDOW);
+        await loadRange(session, wStart, Math.max(wEnd, wStart + 0.05), function (p) {
+          progress('Loading', (wStart + p * (wEnd - wStart)) / d);
+        }, job);
+        var take = {}, tracks = {};
+        for (var i = 0; i < kinds.length; i++) {
+          var kind = kinds[i];
+          take[kind] = cursor[kind] < end - tol ? pieces(kind, wEnd) : [];
+          if (take[kind].length) {
+            var blob = new Blob([take[kind][0].init].concat(take[kind].map(function (f) { return f.blob; })));
+            tracks[kind] = await openTrack(MB, inputs, blob, kind);
+          }
+        }
+        if (!out) {
+          // Not loaded after all: around again (the file needs every stream from the start).
+          if (kinds.some(function (k) { return !tracks[k]; })) { disposeAll(inputs); continue; }
+          await begin(tracks, take);
+        }
+        await Promise.all(kinds.map(function (kind) { return tracks[kind] ? write(kind, tracks[kind], take[kind]) : null; }));
+        disposeAll(inputs);
+        var at = Math.min.apply(null, kinds.map(function (k) { return cursor[k]; }));
+        if (at > wStart + tol) idle = 0;
+        progress('Copying', Math.min(1, at / d));
+      }
+      if (!out) throw failure('Nothing came out.');
+      src.video.close();
+      if (src.audio) src.audio.close();
+      await out.finalize();
+    } catch (e) {
+      disposeAll(inputs);
+      if (out) { try { await out.cancel(); } catch (err) {} } else if (file) { try { await file.writable.abort(); } catch (err) {} }
+      if (file) removeClipFile(file.name);
+      throw e;
+    }
+    return { file: file, ext: ext, seconds: d, width: W, height: H, codecs: codecs, copied: true };
+  }
+
+  var CODEC_NAMES = { av1: 'AV1', vp9: 'VP9', vp8: 'VP8', avc: 'H.264', hevc: 'H.265', opus: 'Opus', aac: 'AAC', vorbis: 'Vorbis', mp3: 'MP3' };
+
+  function makeClip() {
+    var st = ui;
+    if (!st) return;
+    if (st.clipJob) { st.clipJob.cancelled = true; return; } // the button says Stop while it works
+    var media = window.__gleanerMedia, v = mainVideo(), fmt = playerFormat();
+    if (!media) { setClipNote('Refresh the page once, then try again: ' + BRAND + ' starts keeping the video as the page loads.', true); return; }
+    if (!v) { setClipNote('No video found on the page.', true); return; }
+    if (!videoLength()) { setClipNote("Live streams can be clipped once they've ended.", true); return; }
+    if (v.mediaKeys || media.protected()) { setClipNote("This video is protected (DRM), so it can't be clipped.", true); return; }
+    if (isAdPlaying()) { setClipNote('Try again once the ad is over.', true); return; }
+    if (!st.clipParts.length || st.clipParts.some(function (p) { return !(p.to >= p.from); })) { setClipNote('Each part has to end at or after its start.', true); return; }
+    var parts = partsInOrder(st), whole = isWhole(st, fmt.fps);
+    releaseClip(st);
+    var job = st.clipJob = { cancelled: false, videoId: st.videoId }, began = Date.now(), session = null, switched = false;
+    function progress(stage, p) {
+      if (ui !== st || st.clipJob !== job) return;
+      p = Math.max(0, Math.min(1, p));
+      var spent = (Date.now() - began) / 1000, left = p > 0.02 && spent > 5 ? spent * (1 - p) / p : 0;
+      var label = stage + ' ' + Math.round(p * 100) + '%' + (left > 5 ? ', ' + lengthWords(left) + ' left' : '');
+      if (label === st.clipStatus) return;
+      st.clipStatus = label;
+      render();
+    }
+    st.clipStatus = 'Starting';
+    setClipNote('');
+    clipEngine().then(function (MB) {
+      session = playerSession(job);
+      if (!whole) return encodeParts(MB, parts, fmt, session, progress, job);
+      return copyWhole(MB, fmt, session, progress, job).catch(function (e) {
+        if (!e || e.code !== 'switched') throw e;
+        // YouTube changed quality partway: one file can't hold both, so it's re-encoded.
+        switched = true;
+        return encodeParts(MB, [{ from: 0, to: lastMoment() }], fmt, session, progress, job);
+      });
+    }).then(async function (res) {
+      if (session) session.restore();
+      if (ui !== st || st.clipJob !== job) { removeClipFile(res.file.name); return; }
+      var f = await res.file.handle.getFile();
+      st.clipJob = null;
+      var title = safeFileName(readDetails(st.videoId).title);
+      var name = whole ? title + '.' + res.ext
+        : parts.length > 1 ? title + ' (' + parts.length + ' parts).' + res.ext
+        : title + ' (' + clipClock(res.first).replace(/:/g, '.') + ' to ' + clipClock(res.last).replace(/:/g, '.') + ').' + res.ext;
+      var type = res.ext === 'mp4' ? 'video/mp4' : res.ext === 'webm' ? 'video/webm' : 'video/x-matroska';
+      st.clipResult = { file: f, url: URL.createObjectURL(f), name: name, type: type, stored: res.file.name };
+      var took = lengthWords((Date.now() - began) / 1000);
+      if (res.copied) {
+        setClipNote('Whole video ready: ' + lengthWords(res.seconds) + ' at ' + res.width + '×' + res.height + ', ' + sizeWords(f.size) + ', in ' + took + '. ' +
+          'Copied as YouTube sent it (' + (CODEC_NAMES[res.codecs.video] || res.codecs.video) + ' video' +
+          (res.codecs.audio ? ', ' + (CODEC_NAMES[res.codecs.audio] || res.codecs.audio) + ' sound' : '') + ', in a ' + res.ext.toUpperCase() + ' file).');
+      } else {
+        setClipNote((switched ? 'YouTube changed quality partway, so the video was re-encoded. ' : '') +
+          'Made a ' + secsWords(res.seconds) + (whole ? ' video' : ' clip') + (parts.length > 1 ? ' from ' + parts.length + ' parts' : '') + ': ' +
+          fmtNumber(res.frames) + ' frames at ' + res.width + '×' + res.height + ', ' + sizeWords(f.size) + ', in ' + took + '.');
+      }
+    }, function (e) {
+      if (session) session.restore();
+      if (ui !== st || st.clipJob !== job) return;
+      st.clipJob = null;
+      if (e && e.code === 'moved') return;
+      if (e && e.code === 'stopped') setClipNote('Stopped.');
+      else setClipNote("The clip didn't work: " + plainError(e), true);
+    });
+  }
+
+  // Must run inside a click (see saveFile).
+  function saveClip() {
+    var r = ui && ui.clipResult;
+    if (r) saveFile(r.name, r.file, r.type);
+  }
+  function setClipNote(text, bad) {
+    if (!ui) return;
+    ui.clipNote = text || '';
+    ui.clipBad = !!bad;
+    render();
+  }
+  function releaseClip(st) {
+    if (!st.clipResult) return;
+    URL.revokeObjectURL(st.clipResult.url);
+    removeClipFile(st.clipResult.stored);
+    st.clipResult = null;
+  }
+
+  // ------------------------------------------------------------ clip editor
+
+  function toggleClip() {
+    var st = ui;
+    if (!st) return;
+    st.clipOpen = !st.clipOpen;
+    var v = mainVideo();
+    if (st.clipOpen && v) {
+      if (!st.clipParts.length) {
+        var t = frameNow() || 0;
+        st.clipParts.push({ from: t, to: Math.min(lastMoment() || t + 10, t + 10) });
+        st.clipSel = 0;
+        st.clipSnap = { part: 0, edge: 'from' };
+      }
+      watchFrames();
+      // Shows the same frame again, so the browser says exactly which it is.
+      if (v.paused) v.currentTime = v.currentTime;
+    }
+    render();
+  }
+  function addPart() {
+    var st = ui;
+    if (!st || !videoLength()) return;
+    var fps = playerFormat().fps, t = frameNow() || 0;
+    // On the playhead, or just after the part it's in.
+    st.clipParts.forEach(function (p) { if (t >= p.from - 1e-3 && t <= p.to + 1e-3) t = p.to + 1 / fps; });
+    t = Math.min(lastMoment(), t);
+    st.clipParts.push({ from: t, to: Math.min(lastMoment(), t + 10) });
+    st.clipSel = st.clipParts.length - 1;
+    st.clipNote = '';
+    render();
+  }
+  function removePart() {
+    var st = ui;
+    if (!st || st.clipParts.length < 2) return;
+    st.clipParts.splice(st.clipSel, 1);
+    st.clipSel = Math.min(st.clipSel, st.clipParts.length - 1);
+    st.clipSnap = null;
+    render();
+  }
+  function selectWhole() {
+    var st = ui;
+    if (!st || !videoLength()) return;
+    st.clipParts = [{ from: 0, to: lastMoment() }];
+    st.clipSel = 0;
+    st.clipSnap = null;
+    st.clipNote = '';
+    render();
+  }
+  // One frame back or forward, paused: into the middle of the next frame, so
+  // it moves by exactly one.
+  function stepFrame(dir) {
+    var v = mainVideo();
+    if (!v) return;
+    v.pause();
+    var fps = playerFormat().fps, t = frameNow();
+    v.currentTime = Math.max(0, dir > 0 ? t + 1.5 / fps : t - 0.5 / fps);
+    watchFrames();
+  }
+  // edge: 'from' or 'to' of the chosen part. With no time, the frame on
+  // screen; with a typed time, the frame on screen then (the player goes
+  // there to show it).
+  function setClipTime(edge, t) {
+    var st = ui, v = mainVideo(), p = st && selectedPart(st);
+    if (!p || !v) return;
+    var typed = t !== null && t !== undefined, len = p.to - p.from;
+    if (!typed) t = frameNow();
+    t = Math.max(0, Math.min(lastMoment() || t, t));
+    p[edge] = t;
+    // Past the other needle: the part moves, keeping its length.
+    if (p.to < p.from) {
+      if (edge === 'from') p.to = Math.min(lastMoment(), p.from + len);
+      else p.from = Math.max(0, p.to - len);
+    }
+    if (typed) {
+      showMoment(t, true);
+      st.clipSnap = { part: st.clipParts.indexOf(p), edge: edge };
+      watchFrames();
+    }
+    st.clipNote = '';
+    st.clipBad = false;
+    render();
+  }
+  // Arrow keys on a needle: a frame (Shift: a second) at a time.
+  function nudgeNeedle(i, edge, dir, big) {
+    var st = ui, p = st && st.clipParts[i];
+    if (!p) return;
+    var fps = playerFormat().fps;
+    var t = big ? p[edge] + dir : dir > 0 ? p[edge] + 1.5 / fps : p[edge] - 0.5 / fps;
+    t = Math.max(0, Math.min(lastMoment(), t));
+    p[edge] = edge === 'from' ? Math.min(t, p.to) : Math.max(t, p.from);
+    st.clipSel = i;
+    showMoment(p[edge], true);
+    st.clipSnap = { part: i, edge: edge };
+    watchFrames();
+    render();
+  }
+
+  // Shows the frame at t while a needle is dragged: one seek at a time, always
+  // to the latest place (seeks that pile up leave the video lagging behind).
+  var seekWant = null, seekBusy = 0;
+  function liveSeek(t) {
+    var v = mainVideo();
+    if (!v) return;
+    seekWant = t;
+    if (seekBusy && Date.now() - seekBusy < 1500) return;
+    seekBusy = Date.now();
+    if (!v.paused) v.pause();
+    var target = seekWant;
+    seekWant = null;
+    v.addEventListener('seeked', function done() {
+      v.removeEventListener('seeked', done);
+      seekBusy = 0;
+      if (seekWant !== null) liveSeek(seekWant);
+    });
+    v.currentTime = target;
+  }
+
+  // A thumbnail of the moment under the pointer (or the needle being
+  // dragged), with its exact time, above the bar: instant, from YouTube's
+  // own preview thumbnails. Fixed to the window, so the panel can't clip it.
+  function peekAt(c, t, x) {
+    var st = ui, d = videoLength();
+    if (!st || !d) return;
+    if (c.peekFor !== st.videoId) { c.peekFor = st.videoId; c.peekBoard = storyboard(st.videoId, 3); }
+    var sb = c.peekBoard;
+    c.peekImg.hidden = !sb;
+    if (sb) {
+      var w = 192, h = Math.round(w * sb.h / sb.w), s = sprite(sb, t, d, w, h);
+      c.peekImg.style.width = w + 'px';
+      c.peekImg.style.height = h + 'px';
+      c.peekImg.style.backgroundImage = s.image;
+      c.peekImg.style.backgroundSize = s.size;
+      c.peekImg.style.backgroundPosition = s.position;
+    }
+    c.peekTime.textContent = clipClock(t);
+    c.peek.hidden = false;
+    var rect = c.bar.getBoundingClientRect(), pw = c.peek.offsetWidth, ph = c.peek.offsetHeight;
+    var top = rect.top - ph - 14;
+    if (top < 64) top = rect.bottom + 14; // under YouTube's top bar: below the bar instead
+    c.peek.style.left = Math.max(4, Math.min(window.innerWidth - pw - 4, x - pw / 2)) + 'px';
+    c.peek.style.top = top + 'px';
+  }
+  function hidePeek() {
+    var c = ui && ui.refs && ui.refs.clipRow;
+    if (c) c.peek.hidden = true;
+  }
+
+  // Dragging a needle moves that end of its part, with the frame there on the
+  // video and in the thumbnail above; a click anywhere else on the bar shows
+  // that moment.
+  function onBarDown(e) {
+    var st = ui, bar = e.currentTarget, d = videoLength();
+    if (e.button !== 0 || !st || !d || st.clipJob) return;
+    var rect = bar.getBoundingClientRect();
+    function timeAt(x) { return Math.max(0, Math.min(lastMoment(), (x - rect.left) / rect.width * d)); }
+    var needle = e.target.closest('.sc-needle'), partNode = e.target.closest('.sc-part');
+    if (!needle) {
+      if (partNode) st.clipSel = +partNode.getAttribute('data-i');
+      showMoment(timeAt(e.clientX), false);
+      render();
+      return;
+    }
+    e.preventDefault();
+    var i = +needle.parentNode.getAttribute('data-i'), edge = needle.getAttribute('data-edge');
+    st.clipSel = i;
+    st.clipDrag = { part: i, edge: edge };
+    needle.focus({ preventScroll: true });
+    bar.setPointerCapture(e.pointerId);
+    function move(ev) {
+      var p = st.clipParts[i];
+      if (!p) return;
+      var t = timeAt(ev.clientX);
+      if (edge === 'from') p.from = Math.min(t, p.to); else p.to = Math.max(t, p.from);
+      liveSeek(p[edge]);
+      peekAt(st.refs.clipRow, p[edge], rect.left + p[edge] / d * rect.width);
+      render();
+    }
+    function up() {
+      bar.removeEventListener('pointermove', move);
+      bar.removeEventListener('pointerup', up);
+      bar.removeEventListener('pointercancel', up);
+      st.clipDrag = null;
+      hidePeek();
+      var p = st.clipParts[i];
+      if (!p) return;
+      showMoment(p[edge], true);
+      st.clipSnap = { part: i, edge: edge };
+      watchFrames();
+      render();
+    }
+    bar.addEventListener('pointermove', move);
+    bar.addEventListener('pointerup', up);
+    bar.addEventListener('pointercancel', up);
+  }
+
+  // YouTube's own preview thumbnails (what its timeline shows on hover), at
+  // the sharpest level up to `want` it has: level 0 is one small sheet,
+  // level 1 is sharp enough for the bar, level 3 for the preview.
+  function storyboard(videoId, want) {
+    var pr = playerResponse(videoId);
+    var spec = pr && pr.storyboards && pr.storyboards.playerStoryboardSpecRenderer && pr.storyboards.playerStoryboardSpecRenderer.spec;
+    var levels = String(spec || '').split('|'), base = levels[0];
+    if (!/^https:\/\/i\.ytimg\.com\//.test(base)) return null;
+    for (var level = Math.min(want, levels.length - 2); level >= 0; level--) {
+      var f = (levels[level + 1] || '').split('#');
+      var w = +f[0], h = +f[1], count = +f[2], cols = +f[3], rows = +f[4];
+      if (!(w > 0 && h > 0 && count > 0 && cols > 0 && rows > 0) || !f[6] || !f[7]) continue;
+      return {
+        w: w, h: h, count: count, cols: cols, rows: rows, gap: (+f[5] || 0) / 1000,
+        sheet: (function (lv, name, sigh) {
+          return function (n) {
+            return base.replace('$L', String(lv)).replace('$N', name.replace('$M', String(n))) + (base.indexOf('?') >= 0 ? '&' : '?') + 'sigh=' + sigh;
+          };
+        })(level, f[6], f[7])
+      };
+    }
+    return null;
+  }
+
+  // Where the thumbnail for moment t sits in its sheet, shown at tw × th.
+  function sprite(sb, t, d, tw, th) {
+    var per = sb.cols * sb.rows;
+    var k = Math.max(0, Math.min(sb.count - 1, sb.gap > 0 ? Math.floor(t / sb.gap) : Math.floor(t / d * sb.count)));
+    var sheet = Math.floor(k / per), cell = k % per;
+    // The last sheet holds only the thumbnails left, so it's smaller.
+    var inSheet = Math.min(per, sb.count - sheet * per), rowsIn = Math.ceil(inSheet / sb.cols), colsIn = rowsIn > 1 ? sb.cols : inSheet;
+    return {
+      image: 'url("' + sb.sheet(sheet) + '")',
+      size: (colsIn * tw) + 'px ' + (rowsIn * th) + 'px',
+      position: (-(cell % sb.cols) * tw) + 'px ' + (-Math.floor(cell / sb.cols) * th) + 'px'
+    };
+  }
+
+  function renderStrip(c, st) {
+    var w = c.bar.clientWidth, h = c.bar.clientHeight, d = videoLength();
+    var key = st.videoId + ':' + w + ':' + Math.round(d);
+    if (!w || !h || !d || c.stripKey === key) return;
+    var sb = storyboard(st.videoId, 1);
+    if (!sb) return; // no thumbnails (yet): a plain bar
+    c.stripKey = key;
+    c.strip.textContent = '';
+    var n = Math.max(1, Math.round(w / (h * sb.w / sb.h))), tw = w / n;
+    for (var i = 0; i < n; i++) {
+      var s = sprite(sb, (i + 0.5) / n * d, d, tw, h), tile = el('div', { class: 'sc-tile' });
+      tile.style.width = tw + 'px';
+      tile.style.backgroundImage = s.image;
+      tile.style.backgroundSize = s.size;
+      tile.style.backgroundPosition = s.position;
+      c.strip.appendChild(tile);
+    }
+  }
+
+  function renderBar(c, st) {
+    var d = videoLength(), fd = 1 / playerFormat().fps, kids = c.layer.children;
+    renderStrip(c, st);
+    while (kids.length > st.clipParts.length) c.layer.lastChild.remove();
+    while (kids.length < st.clipParts.length) {
+      c.layer.appendChild(el('div', { class: 'sc-part' }, [
+        el('div', { class: 'sc-needle', 'data-edge': 'from', tabindex: '0', role: 'slider', 'aria-label': 'Start of part', title: 'Drag to choose where this part starts (arrow keys: one frame)' }),
+        el('div', { class: 'sc-needle', 'data-edge': 'to', tabindex: '0', role: 'slider', 'aria-label': 'End of part', title: 'Drag to choose where this part ends (arrow keys: one frame)' })
+      ]));
+    }
+    st.clipParts.forEach(function (p, i) {
+      var n = kids[i];
+      n.setAttribute('data-i', String(i));
+      n.classList.toggle('sc-sel', i === st.clipSel);
+      n.style.left = d ? (p.from / d * 100) + '%' : '0';
+      n.style.width = d ? (Math.max(0, Math.min(d, p.to + fd) - p.from) / d * 100) + '%' : '0';
+      n.firstChild.setAttribute('aria-valuetext', clipClock(p.from));
+      n.lastChild.setAttribute('aria-valuetext', clipClock(p.to));
+    });
+    movePlayhead();
+  }
+
+  function buildClipRow() {
+    var strip = el('div', { class: 'sc-strip' });
+    var layer = el('div', { class: 'sc-parts' });
+    var playhead = el('div', { class: 'sc-playhead' });
+    var bar = el('div', { class: 'sc-bar', title: 'The whole video. Drag the needles to choose each part; click anywhere to see that moment.' }, [strip, layer, playhead]);
+    bar.addEventListener('pointerdown', onBarDown);
+    bar.addEventListener('pointermove', function (e) {
+      var st = ui, d = videoLength();
+      if (!st || st.clipDrag || !d) return;
+      var rect = bar.getBoundingClientRect();
+      peekAt(st.refs.clipRow, Math.max(0, Math.min(lastMoment(), (e.clientX - rect.left) / rect.width * d)), e.clientX);
+    });
+    bar.addEventListener('pointerleave', function () { if (ui && !ui.clipDrag) hidePeek(); });
+    bar.addEventListener('keydown', function (e) {
+      var n = e.target.closest && e.target.closest('.sc-needle');
+      if (!n) return;
+      e.stopPropagation(); // keep YouTube's own keys out
+      if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+      e.preventDefault();
+      nudgeNeedle(+n.parentNode.getAttribute('data-i'), n.getAttribute('data-edge'), e.key === 'ArrowRight' ? 1 : -1, e.shiftKey);
+    });
+
+    function timeBox(label, edge) {
+      var input = el('input', { class: 'sc-ask sc-time', type: 'text', spellcheck: 'false', autocomplete: 'off', 'aria-label': label, title: 'Type a time (like 1:23.450) to choose the frame on screen then' });
+      ['keydown', 'keyup', 'keypress'].forEach(function (t) { input.addEventListener(t, function (e) { e.stopPropagation(); }); });
+      input.addEventListener('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); input.blur(); } });
+      input.addEventListener('change', function () {
+        var t = parseClipClock(input.value);
+        if (t === null) { render(); return; }
+        setClipTime(edge, t);
+      });
+      return input;
+    }
+    var partName = el('span', { class: 'sc-partname' });
+    var setFrom = makeButton('sc-tonal', 'first', 'Start', 'Start this part at the frame on screen now', function () { setClipTime('from', null); });
+    var from = timeBox('Start time', 'from');
+    var back = makeButton('sc-tonal sc-mini', 'prev', '', 'One frame back', function () { stepFrame(-1); });
+    var fwd = makeButton('sc-tonal sc-mini', 'next', '', 'One frame forward', function () { stepFrame(1); });
+    var setTo = makeButton('sc-tonal', 'last', 'End', 'End this part at the frame on screen now (that frame is in the clip)', function () { setClipTime('to', null); });
+    var to = timeBox('End time', 'to');
+    var remove = makeButton('sc-tonal sc-mini', 'trash', '', 'Remove this part', removePart);
+
+    var add = makeButton('sc-tonal', 'plus', 'Add part', 'Add another part (parts are joined in time order, with no gap)', addPart);
+    var whole = makeButton('sc-tonal', 'movie', 'Whole video', 'Select the whole video', selectWhole);
+    var len = el('span', { class: 'sc-cliplen' });
+    var make = makeButton('sc-primary', 'scissors', 'Make clip', '', makeClip);
+
+    var preview = el('video', { class: 'sc-clipvid', controls: '', preload: 'metadata', playsinline: '', draggable: 'true', title: 'Drag this onto your desktop or into a folder to save it there' });
+    preview.addEventListener('dragstart', function (e) {
+      var r = ui && ui.clipResult;
+      // Chrome turns this into a real file where it's dropped.
+      if (r) e.dataTransfer.setData('DownloadURL', r.type + ':' + r.name + ':' + r.url);
+    });
+    var save = makeButton('sc-tonal', 'download', 'Save', 'Save it in your downloads', saveClip);
+    var result = el('div', { class: 'sc-row sc-clipresult' }, [preview, save.node]);
+    var note = el('div', { class: 'sc-note', role: 'status', 'aria-live': 'polite' });
+    var peekImg = el('div', { class: 'sc-peek-img' }), peekTime = el('div', { class: 'sc-peek-time' });
+    var peek = el('div', { class: 'sc-peek', hidden: '' }, [peekImg, peekTime]);
+
+    var node = el('div', { class: 'sc-cut' }, [
+      peek,
+      bar,
+      el('div', { class: 'sc-row' }, [partName, setFrom.node, from, back.node, fwd.node, setTo.node, to, remove.node]),
+      el('div', { class: 'sc-row sc-cliptools' }, [add.node, whole.node, len, make.node]),
+      result, note
+    ]);
+    return {
+      node: node, bar: bar, strip: strip, layer: layer, playhead: playhead, stripKey: '',
+      peek: peek, peekImg: peekImg, peekTime: peekTime, peekFor: null, peekBoard: null,
+      partName: partName, from: from, to: to, remove: remove, len: len, make: make, preview: preview, result: result, note: note
+    };
+  }
+
+  function renderClip(r) {
+    var c = r.clipRow, st = ui;
+    if (!c) return;
+    r.clip.node.setAttribute('aria-pressed', String(!!st.clipOpen));
+    c.node.hidden = !st.clipOpen;
+    if (!st.clipOpen) return;
+    var fmt = playerFormat(), d = videoLength(), p = selectedPart(st), many = st.clipParts.length > 1;
+    renderBar(c, st);
+    c.partName.textContent = many ? 'Part ' + (st.clipParts.indexOf(p) + 1) + ' of ' + st.clipParts.length : '';
+    c.partName.hidden = !many;
+    c.remove.node.hidden = !many;
+    if (document.activeElement !== c.from) c.from.value = p ? clipClock(p.from) : '';
+    if (document.activeElement !== c.to) c.to.value = p ? clipClock(p.to) : '';
+    var whole = isWhole(st, fmt.fps), secs = 0;
+    st.clipParts.forEach(function (q) { secs += Math.max(0, q.to - q.from) + 1 / fmt.fps; });
+    c.len.textContent = !d ? '' : whole
+      ? 'Whole video · ' + lengthWords(d) + ' · copied as YouTube sent it' + (fmt.height ? ' (' + qualityLabel(fmt) + ')' : '')
+      : (many ? st.clipParts.length + ' parts · ' : '') + secsWords(secs) + ' · about ' + fmtNumber(Math.round(secs * fmt.fps)) + ' frames' +
+        (fmt.height ? ' · ' + qualityLabel(fmt) : '');
+    c.len.title = "Clips come out in the quality the player is showing. For a sharper clip, pick a higher quality in YouTube's settings first.";
+    setButton(c.make, st.clipJob ? 'busy' : 'idle', st.clipJob ? (st.clipStatus || 'Working') + ' · Stop' : whole ? 'Make video' : 'Make clip');
+    c.make.node.title = st.clipJob ? 'Click to stop' : whole
+      ? 'Copy the whole video as YouTube sent it: full quality, no re-encoding'
+      : 'Cut exactly these frames into an MP4' + (many ? ', parts joined in time order' : '');
+    c.result.hidden = !st.clipResult;
+    if (st.clipResult && c.preview.getAttribute('src') !== st.clipResult.url) c.preview.src = st.clipResult.url;
+    c.note.textContent = st.clipNote;
+    c.note.classList.toggle('sc-bad', !!st.clipBad);
+  }
+
   // ---------------------------------------------------------- saved exports
   //
   // background.js keeps every export (see exportComments), so a video's export
@@ -1822,13 +3025,13 @@
     delete cacheCalls[m.id];
     done(m.res || { ok: false });
   });
-  function cacheCall(op, args) {
+  function cacheCall(op, args, waitMs) {
     return new Promise(function (resolve) {
       var id = 'c' + (++cacheSeq);
       cacheCalls[id] = resolve;
       setTimeout(function () {
         if (cacheCalls[id]) { delete cacheCalls[id]; resolve({ ok: false, error: 'no answer' }); }
-      }, 120000);
+      }, waitMs || 120000);
       window.dispatchEvent(new CustomEvent('scribe:cache', { detail: JSON.stringify(Object.assign({ id: id, op: op }, args)) }));
     });
   }
@@ -1846,27 +3049,73 @@
     catch (e) { return ''; }
   }
   function savedNote(meta) {
-    var head = 'Saved ' + whenText(meta.updatedAt) + ': ' + fmtNumber(meta.rows + (meta.unflushed || []).length) + ' rows. ';
-    return head + (meta.finished ? 'Save spreadsheet, get new comments with Update, or Start over.' : 'Save spreadsheet, Continue, or Start over.');
+    var have = meta.rows + (meta.unflushed || []).length;
+    var head = 'Saved ' + whenText(meta.updatedAt) + ': ' + fmtNumber(have) + (meta.finished || !meta.total ? '' : ' of ' + fmtNumber(meta.total)) + ' rows';
+    // How long the rest would take at the pace it last ran.
+    if (!meta.finished && meta.pace && meta.total > have) head += ', about ' + timeLeft((meta.total - have) / meta.pace) + ' to finish';
+    return head + '. ' + (meta.finished ? 'Save spreadsheet, get new comments with Update, or Start over.' : 'Save spreadsheet, Continue, or Start over.');
   }
 
-  // When the panel opens: is there a saved export of this video? Without an
-  // answer from the extension, exports stay in the page as before.
+  // As soon as a video opens: is there a saved export of it? Without an
+  // answer from the extension, exports stay in the page as before. The
+  // extension's relay may still be loading, so no answer means ask again later.
   function loadSaved(st) {
-    if (st.storeOk !== null) return;
-    st.storeOk = false;
-    cacheCall('get', { videoId: st.videoId }).then(function (res) {
+    if (st.storeOk !== null || st.savedAsking) return;
+    st.savedAsking = true;
+    cacheCall('get', { videoId: st.videoId }, 5000).then(function (res) {
+      st.savedAsking = false;
       if (ui !== st) return;
-      st.storeOk = !!(res && res.ok);
-      var meta = res && res.ok ? res.meta : null;
-      if (!meta || st.exportJob || st.exportState !== 'idle') return;
-      st.exportSaved = meta;
-      st.exportState = meta.finished ? 'ready' : 'paused';
-      st.exportCount = meta.rows;
-      st.exportTotal = st.exportTarget = meta.total || 0;
-      setNote(savedNote(meta));
+      if (!res || (!res.ok && res.error === 'no answer')) {
+        if (++st.savedTries < 4) setTimeout(function () { if (ui === st) loadSaved(st); }, 2000);
+        return;
+      }
+      st.storeOk = !!res.ok;
+      var meta = res.ok ? res.meta : null;
+      if (meta && !st.exportJob && st.exportState === 'idle') {
+        st.exportSaved = meta;
+        st.exportState = meta.finished ? 'ready' : 'paused';
+        st.exportCount = meta.rows;
+        st.exportTotal = st.exportTarget = meta.total || 0;
+        setNote(savedNote(meta));
+      }
+      autoSave(st);
     });
   }
+
+  // Saving by itself: once a video is open in a tab that's on screen, its
+  // comments start saving, a paused export carries on, and a finished one
+  // picks up the comments posted since. It reads gently (see exportComments)
+  // and stops when the video changes; a click on Stop ends it for this visit.
+  var AUTO_KEY = 'scribe.autoSave';
+  function autoOn() {
+    var v = null;
+    try { v = localStorage.getItem(AUTO_KEY); } catch (e) {}
+    return v === null ? BUILD === 'dev' : v === 'on';
+  }
+  function toggleAuto() {
+    var on = !autoOn();
+    try { localStorage.setItem(AUTO_KEY, on ? 'on' : 'off'); } catch (e) {}
+    if (ui) { ui.autoTried = false; if (on) autoSave(ui); }
+    render();
+  }
+  function autoSave(st) {
+    if (!autoOn() || st.autoTried || ui !== st || st.storeOk !== true || !st.videoId) return;
+    if (document.visibilityState !== 'visible') return; // starts when the tab is looked at
+    if (st.exportJob || (st.exportState !== 'idle' && st.exportState !== 'paused' && st.exportState !== 'ready')) return;
+    var meta = st.exportSaved;
+    if (meta && meta.finished && Date.now() - (meta.updatedAt || 0) < AUTO_UPDATE_AFTER) return;
+    st.autoTried = true;
+    st.exportAuto = true;
+    if (!meta) {
+      st.exportCount = st.exportTotal = st.exportTarget = st.exportWritten = 0;
+      newJob(st, null);
+      runExport(st, 'run');
+    } else {
+      newJob(st, meta);
+      runExport(st, meta.finished ? 'update' : 'run');
+    }
+  }
+  document.addEventListener('visibilitychange', function () { if (ui) autoSave(ui); });
 
   function newJob(st, restore) {
     var job = exportComments(st.videoId, function (count, total, written) {
@@ -1878,9 +3127,10 @@
       if (st.exportMode === 'update') { render(); return; }
       var plan = exportPlan(st.exportRunStart, count - st.exportBase, total ? Math.max(0, total - count) : -1);
       if (!plan.eta || st.exportStopping) { render(); return; }
-      var longNote = st.storeOk ? '. Closing this tab just pauses it: Continue picks up from there later. ' : '. Keep this tab open. ';
-      setNote(plan.eta + (plan.long ? longNote : '. ') + 'Stop anytime to save what has loaded.');
-    }, st.storeOk ? exportStore(st.videoId) : null, restore || null);
+      var lead = st.exportAuto ? 'Saving the comments by itself: ' + fmtNumber(count) + (total ? ' of ' + fmtNumber(total) : '') + '. ' : '';
+      var longNote = st.storeOk ? '. Closing this tab just pauses it: it carries on next time. ' : '. Keep this tab open. ';
+      setNote(lead + plan.eta + (plan.long ? longNote : '. ') + 'Stop anytime to save what has loaded.');
+    }, st.storeOk ? exportStore(st.videoId) : null, restore || null, !!st.exportAuto);
     st.exportJob = job;
     return job;
   }
@@ -1905,6 +3155,7 @@
     st.exportTotal = 0;
     st.exportTarget = 0;
     st.exportWritten = 0;
+    st.exportAuto = false; // a click reads at full speed
     newJob(st, null);
     runExport(st, 'run');
   }
@@ -1919,7 +3170,7 @@
     st.overArmed = false;
     st.exportRunStart = Date.now();
     st.exportBase = st.exportCount; // the time left is judged on this run's pace
-    setNote(mode === 'update' ? 'Getting the comments posted since ' + whenText(st.exportSaved ? st.exportSaved.updatedAt : Date.now()) + '…' : '');
+    setNote(mode === 'update' ? 'Checking for comments posted since ' + whenText(st.exportSaved ? st.exportSaved.updatedAt : Date.now()) + '…' : '');
     job[mode]().then(function (res) {
       if (ui !== st || st.exportJob !== job) return;
       st.exportStopping = false;
@@ -1966,8 +3217,8 @@
     freshSaved(st).then(function () { if (ui === st) render(); });
     if (res.off || res.none) setNote(res.off ? 'Comments are turned off for this video now.' : 'This video has no comments section now.', true);
     else if (!res.complete) setNote('Update stopped, and nothing was added. Update again anytime.');
-    else if (!res.added) setNote('No new comments since ' + whenText(st.exportSaved ? st.exportSaved.updatedAt : Date.now()) + '.');
-    else setNote('Added ' + fmtNumber(res.added) + ' new rows, at the top. Save spreadsheet to get everything.');
+    else if (!res.added) setNote('Up to date: ' + fmtNumber(res.rows) + ' rows saved, and no new comments since ' + whenText(st.exportSaved ? st.exportSaved.updatedAt : Date.now()) + '.');
+    else setNote('Added ' + fmtNumber(res.added) + ' new rows at the top: ' + fmtNumber(res.rows) + ' saved in all. Save spreadsheet to get everything.');
   }
 
   // The Stop button (or Export clicked again while it runs): pauses the
@@ -1983,7 +3234,8 @@
   function continueExport() {
     var st = ui;
     if (!st || st.exportState !== 'paused') return;
-    if (st.exportJob) { runExport(st, 'run'); return; }
+    st.exportAuto = false; // a click reads at full speed
+    if (st.exportJob) { st.exportJob.setGentle(false); runExport(st, 'run'); return; }
     // A saved export from an earlier visit: carry on from its note.
     freshSaved(st).then(function (meta) {
       if (ui !== st || st.exportState !== 'paused' || st.exportJob) return;
@@ -1998,6 +3250,7 @@
     if (!st || st.exportState !== 'ready' || !st.storeOk) return;
     freshSaved(st).then(function (meta) {
       if (ui !== st || st.exportState !== 'ready' || !meta || !meta.finished) return;
+      st.exportAuto = false;
       newJob(st, meta);
       runExport(st, 'update');
     });
@@ -2175,7 +3428,7 @@
       document.querySelector('#top-level-buttons-computed');
     if (onScreen(row)) { rowMissingSince = 0; return row; }
     // YouTube tries new layouts now and then. If the usual button row stays
-    // missing or hidden on a watch page, use a nearby row so Scribe stays
+    // missing or hidden on a watch page, use a nearby row so Gleaner stays
     // reachable. The wait keeps it from jumping around while the page loads.
     if (!document.querySelector('ytd-watch-metadata')) return row;
     if (!rowMissingSince) {
@@ -2283,9 +3536,14 @@
   function switchVideo(videoId) {
     if (ui && ui.sendBusy) dispatchCancel('Nothing was sent: you left the video before it was ready.');
     if (ui && ui.exportJob) ui.exportJob.stop();
+    if (ui && ui.clipJob) ui.clipJob.cancelled = true;
+    if (ui) releaseClip(ui);
     if (ui && ui.panel) ui.panel.remove();
-    ui = freshState(videoId);
+    var st = ui = freshState(videoId);
     rowMissingSince = 0;
+    // A saved export of this video, and saving by itself, are looked at right
+    // away (a moment later, so the extension's relay has loaded).
+    if (videoId) setTimeout(function () { if (ui === st) loadSaved(st); }, 1500);
     var pill = document.getElementById('scribe-pill');
     if (pill) pill.setAttribute('aria-expanded', 'false');
   }
@@ -2328,6 +3586,10 @@
       copy: ui.copy, send: ui.send, note: ui.note, lastCopyChars: ui.lastCopyChars,
       exportState: ui.exportState, exportCount: ui.exportCount, exportTotal: ui.exportTotal,
       exportWritten: ui.exportWritten, // rows already in the file, out of the page's memory
+      clipOpen: ui.clipOpen, clipParts: ui.clipParts.map(function (p) { return [p.from, p.to]; }), clipSel: ui.clipSel,
+      clipStatus: ui.clipJob ? ui.clipStatus : '', clipNote: ui.clipNote,
+      clipBytes: ui.clipResult ? ui.clipResult.file.size : 0, clipName: ui.clipResult ? ui.clipResult.name : '',
+      media: window.__gleanerMedia ? window.__gleanerMedia.state(mainVideo()) : null,
       heapMB: window.performance && performance.memory ? Math.round(performance.memory.usedJSHeapSize / 1048576) : null,
       build: BUILD
     };

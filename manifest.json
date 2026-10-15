@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
-  "name": "Scribe",
-  "version": "3.2",
+  "name": "Gleaner",
+  "version": "3.3",
   "minimum_chrome_version": "116",
   "description": "Copy any YouTube video's transcript, details and comments in one click, or send them to Claude.",
   "icons": {
@@ -11,6 +11,12 @@
     "128": "icons/icon128.png"
   },
   "content_scripts": [
+    {
+      "matches": ["https://www.youtube.com/*"],
+      "js": ["media-keeper.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
     {
       "matches": ["https://www.youtube.com/*"],
       "js": ["content.js"],

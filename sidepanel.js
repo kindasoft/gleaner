@@ -120,7 +120,7 @@ function stopPreparing() {
 function showPreparing(p) {
   if (!p || pendingPrompt != null) return;
   if (p.cancelled) {
-    // Scribe gave up before the prompt was ready: say why instead of spinning.
+    // Gleaner gave up before the prompt was ready: say why instead of spinning.
     if (preparingShown) { stopPreparing(); showBar(p.cancelled); }
     return;
   }

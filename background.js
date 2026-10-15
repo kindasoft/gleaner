@@ -171,6 +171,21 @@ chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
     return true; // answering asynchronously
   }
 
+  // The clip cutter (lib/mediabunny.js) goes into the page only when a clip is
+  // made: it's big, and most visits never need it. Injected this way, the
+  // page's own script rules don't apply to it.
+  if (msg.action === 'clipEngine') {
+    if (!sender.tab) return;
+    chrome.scripting.executeScript({
+      target: { tabId: sender.tab.id, frameIds: [sender.frameId || 0] },
+      world: 'MAIN',
+      files: ['lib/mediabunny.js']
+    }).then(function () { sendResponse({ ok: true }); }, function (e) {
+      sendResponse({ ok: false, error: String((e && e.message) || e).slice(0, 200) });
+    });
+    return true; // answering asynchronously
+  }
+
   if (msg.action === 'devReload') {
     if (isDevCopy()) chrome.runtime.reload();
     return;
@@ -227,7 +242,7 @@ chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
         // open() also resolves in app and popup windows, which have no side panel.
         return chrome.windows.get(win).then(function (w) { return w.type === 'normal'; }, function () { return true; });
       }, function (e) {
-        console.warn('[Scribe] side panel did not open:', e && e.message);
+        console.warn('[Gleaner] side panel did not open:', e && e.message);
         // It may be open in this window already, which is just as good.
         return chrome.runtime.getContexts({ contextTypes: ['SIDE_PANEL'], windowIds: [win] })
           .then(function (found) { return found.length > 0; }, function () { return false; });
@@ -270,7 +285,7 @@ chrome.runtime.onInstalled.addListener(function () {
 // this worker after about 30 quiet seconds, and the panel reconnects when it
 // does (sidepanel.js). The tab condition on the rules is what keeps websites
 // out either way. An always-on static ruleset would let ANY website frame
-// claude.ai while Scribe is installed; sub_frame navigations skip the
+// claude.ai while Gleaner is installed; sub_frame navigations skip the
 // initiator permission check, so the rules can't be scoped by initiator.
 var panelPorts = 0;
 chrome.runtime.onConnect.addListener(function (port) {
